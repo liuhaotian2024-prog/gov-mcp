@@ -69,6 +69,9 @@ class _State:
         # Baseline storage lock (P0-4 fix: prevents race condition)
         self._baselines_lock = __import__("threading").RLock()
 
+        # P1-2: Per-event Merkle chain state
+        self._prev_event_hash = ""
+
     def next_cieu_seq(self) -> int:
         with self._cieu_seq_lock:
             self._cieu_seq += 1
@@ -231,17 +234,106 @@ def _path_matches_deny(path: str, deny_patterns: list) -> Optional[str]:
     return None
 
 
-def _governance_envelope(state: "_State", latency_ms: float) -> Dict[str, Any]:
+def _normalize_amount(value: Any) -> Optional[float]:
+    """P1-1: Normalize any amount representation to float.
+
+    Handles: 50000, "50000", "$50,000", "USD 50000", "¥50000",
+    "50,000.00", "EUR 1,234.56", "£99.99"
+    Returns None if not parseable as a number.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    # Strip currency symbols
+    for sym in ("$", "¥", "€", "£", "₹", "₩", "₽", "฿", "₫"):
+        s = s.replace(sym, "")
+    # Strip currency codes (3-letter ISO 4217)
+    import re
+    s = re.sub(r"^[A-Z]{3}\s+", "", s.strip())
+    s = re.sub(r"\s+[A-Z]{3}$", "", s.strip())
+    # Strip thousand separators (commas)
+    s = s.replace(",", "")
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _normalize_params_for_value_range(params: Dict[str, Any],
+                                       contract: "IntentContract") -> Dict[str, Any]:
+    """Pre-process params to normalize amounts before value_range check."""
+    if not hasattr(contract, "value_range") or not contract.value_range:
+        return params
+    normalized = dict(params)
+    for param_name in contract.value_range:
+        if param_name in normalized:
+            parsed = _normalize_amount(normalized[param_name])
+            if parsed is not None:
+                normalized[param_name] = parsed
+    return normalized
+
+
+def _compute_event_hash(seq: int, content: str, prev_hash: str = "") -> str:
+    """P1-2: Compute per-event SHA-256 hash for Merkle chain."""
+    import hashlib
+    payload = f"{prev_hash}:{seq}:{content}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _governance_envelope(
+    state: "_State",
+    latency_ms: float,
+    decision: str = "",
+    is_delegated: bool = False,
+    auto_executed: bool = False,
+) -> Dict[str, Any]:
     """Build the governance extension field for every response.
 
-    This is the Y*gov governance layer on top of MCP — patent candidate P7.
-    Backward compatible: callers that don't inspect 'governance' are unaffected.
+    P7 patent candidate: governance layer on top of MCP standard.
+    Includes P1-2 (per-event hash), P1-3 (confidence_score),
+    P1-4 (human_approved).
     """
     contract = state.active_contract
+    seq = state.next_cieu_seq()
+
+    # P1-2: Per-event Merkle hash
+    prev_hash = getattr(state, "_prev_event_hash", "")
+    content = f"{decision}:{latency_ms}:{time.time()}"
+    event_hash = _compute_event_hash(seq, content, prev_hash)
+    state._prev_event_hash = event_hash
+
+    # P1-3: Confidence score
+    if decision == "DENY":
+        confidence = 1.0    # Deterministic denial
+    elif auto_executed:
+        confidence = 0.95   # Router high confidence
+    elif decision == "ALLOW":
+        confidence = 1.0    # Deterministic allow
+    else:
+        confidence = 0.7    # Escalation / uncertain
+
+    # P1-4: Human approved
+    human_approved = is_delegated  # Delegation = human principal authorized
+    approval_chain = []
+    if is_delegated:
+        for link in state.delegation_chain.links:
+            approval_chain.append(link.principal)
+        if not approval_chain and state.delegation_chain.root:
+            approval_chain.append(state.delegation_chain.root.actor)
+
     return {
-        "cieu_seq": state.next_cieu_seq(),
+        "cieu_seq": seq,
+        "event_hash": event_hash,
         "contract_hash": contract.hash if hasattr(contract, "hash") else "",
         "contract_version": contract.name if hasattr(contract, "name") else "",
+        "confidence_score": confidence,
+        "human_approved": human_approved,
+        "approval_chain": approval_chain if approval_chain else None,
         "latency_ms": round(latency_ms, 4),
         "host": _detect_host(),
     }
@@ -333,7 +425,7 @@ def _try_auto_execute(
             "agent_id": agent_id,
             "tool_name": "Bash",
             "auto_executed": False,
-            "governance": _governance_envelope(state, latency_ms),
+            "governance": _governance_envelope(state, latency_ms, decision="DENY"),
         })
 
     # Execute the command
@@ -353,7 +445,7 @@ def _try_auto_execute(
             "returncode": proc.returncode,
             "stdout": proc.stdout[:4096],
             "stderr": proc.stderr[:2048],
-            "governance": _governance_envelope(state, latency_ms),
+            "governance": _governance_envelope(state, latency_ms, decision="ALLOW", auto_executed=True),
         })
     except subprocess.TimeoutExpired:
         latency_ms = (time.perf_counter() - t0) * 1000
@@ -429,21 +521,28 @@ def create_server(
                 return executed
 
         # ── All other actions: governance check only ────────────────
+        # P1-1: Normalize amount params before value_range check
+        check_params = _normalize_params_for_value_range(
+            {"tool_name": tool_name, **params}, effective_contract,
+        )
         result: CheckResult = check(
-            params={"tool_name": tool_name, **params},
+            params=check_params,
             result={},
             contract=effective_contract,
         )
         latency_ms = (time.perf_counter() - t0) * 1000
+        decision = "ALLOW" if result.passed else "DENY"
 
         return json.dumps({
-            "decision": "ALLOW" if result.passed else "DENY",
+            "decision": decision,
             "violations": _violations_to_list(result.violations),
             "agent_id": agent_id,
             "tool_name": tool_name,
             "auto_executed": False,
             "delegated_contract": is_delegated,
-            "governance": _governance_envelope(state, latency_ms),
+            "governance": _governance_envelope(
+                state, latency_ms, decision=decision, is_delegated=is_delegated,
+            ),
         })
 
     @mcp.tool()

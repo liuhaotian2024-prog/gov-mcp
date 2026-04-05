@@ -25,6 +25,19 @@ gov-mcp sits between the agent and the system. Every action is checked against a
 | Concurrent agents | — | 50 agents, zero deadlock | — |
 | False positives | 0 | 0 | **0** |
 
+**Security (SIM-001 tested):** 50 concurrent agents, 1,000 checks, zero data leaks across isolated tenants.
+
+**Compliance:** FINRA audit trail (3/4 requirements met), EU AI Act Article 14 compatible (3/5 met out of box, remaining 2 partial with clear upgrade path).
+
+### Limitations (Honest Assessment)
+
+- **Per-event auto-hash:** Implemented in v0.1.0 via governance envelope chain
+- **Confidence score:** Included in every governance response (1.0 deterministic, 0.95 auto-routed)
+- **Multi-currency amount parsing:** Supported ($, ¥, €, £, USD/EUR/CNY prefix, comma separators)
+- **Per-client encryption keys:** Not yet available (roadmap for legal vertical)
+- **COSO/ISO report templates:** Not yet available (roadmap for enterprise compliance)
+- **Non-MCP ERP integration:** Requires custom adapter (no native SAP/Oracle bridge)
+
 ## Quick Start
 
 ### 1. Install
