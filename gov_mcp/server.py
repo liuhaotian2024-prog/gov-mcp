@@ -172,26 +172,29 @@ def _is_deterministic(command: str, whitelist: Dict[str, Any]) -> Tuple[bool, st
     return False, reason
 
 
-def _try_auto_route(
+def _try_auto_execute(
     command: str,
     agent_id: str,
+    contract: IntentContract,
     state: "_State",
     t0: float,
+    timeout_secs: int = 30,
 ) -> Optional[str]:
-    """If command is deterministic, execute and return result.
+    """Check contract, then execute deterministic commands inline.
 
-    Returns JSON string on auto-route, or None to fall through to normal check.
+    Returns JSON string with stdout/stderr on success, DENY on violation,
+    or None if the command is not deterministic (caller falls through
+    to check-only path).
     """
     ok, route_reason = _is_deterministic(command, state.exec_whitelist)
     if not ok:
         return None
 
-    # Y*gov contract enforcement (even auto-routed commands must pass)
-    effective_contract = _get_contract_for_agent(agent_id, state)
+    # Contract enforcement (must pass even for deterministic commands)
     contract_result: CheckResult = check(
         params={"command": command, "tool_name": "Bash"},
         result={},
-        contract=effective_contract,
+        contract=contract,
     )
     if not contract_result.passed:
         latency_ms = (time.perf_counter() - t0) * 1000
@@ -200,19 +203,20 @@ def _try_auto_route(
             "violations": _violations_to_list(contract_result.violations),
             "agent_id": agent_id,
             "tool_name": "Bash",
-            "auto_routed": True,
+            "auto_executed": False,
             "latency_ms": round(latency_ms, 4),
         })
 
     # Execute the command
     try:
         proc = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=30,
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout_secs,
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         return json.dumps({
             "decision": "ALLOW",
-            "auto_routed": True,
+            "auto_executed": True,
             "route_reason": route_reason,
             "agent_id": agent_id,
             "tool_name": "Bash",
@@ -226,13 +230,13 @@ def _try_auto_route(
         latency_ms = (time.perf_counter() - t0) * 1000
         return json.dumps({
             "decision": "ALLOW",
-            "auto_routed": True,
+            "auto_executed": True,
             "agent_id": agent_id,
             "tool_name": "Bash",
             "command": command,
             "returncode": -1,
             "stdout": "",
-            "stderr": "Command timed out after 30s",
+            "stderr": f"Command timed out after {timeout_secs}s",
             "latency_ms": round(latency_ms, 4),
         })
 
@@ -264,28 +268,38 @@ def create_server(
 
     @mcp.tool()
     def gov_check(agent_id: str, tool_name: str, params: dict) -> str:
-        """Check a proposed agent action against the active governance contract.
+        """Check a proposed agent action and auto-execute if deterministic.
 
-        If the action is a deterministic Bash command that matches the exec
-        whitelist, it is **auto-routed**: executed immediately and the result
-        is returned inline. The agent does not need to call gov_exec separately.
-        Auto-routed results include ``auto_routed: true``.
+        Single entry point for all governance decisions. Replaces the
+        former gov_check + gov_exec two-step flow.
 
-        Non-deterministic or non-whitelisted actions receive the normal
-        ALLOW / DENY governance decision.
+        For Bash commands classified as deterministic by the structural
+        router (ls, git status, cat, pwd, etc.), gov_check will:
+          1. Validate against the agent's governance contract
+          2. Execute the command inline
+          3. Return stdout/stderr in the response
+
+        The caller never needs to invoke a separate execution tool.
+        Non-deterministic or non-Bash actions receive ALLOW/DENY only.
+
+        Response fields:
+          auto_executed: true if the command was run inline
+          stdout/stderr: present only when auto_executed is true
         """
         t0 = time.perf_counter()
         command = params.get("command", "")
-
-        # ── Auto-routing: deterministic Bash commands ───────────────
-        if tool_name == "Bash" and command:
-            routed = _try_auto_route(command, agent_id, state, t0)
-            if routed is not None:
-                return routed
-
-        # ── Normal governance check ─────────────────────────────────
         effective_contract = _get_contract_for_agent(agent_id, state)
         is_delegated = effective_contract is not state.active_contract
+
+        # ── Bash commands: check + auto-execute if deterministic ────
+        if tool_name == "Bash" and command:
+            executed = _try_auto_execute(
+                command, agent_id, effective_contract, state, t0,
+            )
+            if executed is not None:
+                return executed
+
+        # ── All other actions: governance check only ────────────────
         result: CheckResult = check(
             params={"tool_name": tool_name, **params},
             result={},
@@ -298,7 +312,7 @@ def create_server(
             "violations": _violations_to_list(result.violations),
             "agent_id": agent_id,
             "tool_name": tool_name,
-            "auto_routed": False,
+            "auto_executed": False,
             "delegated_contract": is_delegated,
             "latency_ms": round(latency_ms, 4),
         })
@@ -748,98 +762,27 @@ def create_server(
         })
 
     # ===================================================================
-    # EXEC LAYER
+    # EXEC LAYER (deprecated — merged into gov_check)
     # ===================================================================
 
     @mcp.tool()
     def gov_exec(command: str, agent_id: str, timeout_secs: int = 30) -> str:
-        """Execute a command after governance + whitelist check.
+        """[DEPRECATED] Use gov_check instead.
 
-        The command is checked against:
-          1. always_deny list (instant reject, no override)
-          2. allowed_prefixes whitelist (must match at least one)
-          3. Y*gov active contract (deny_commands enforcement)
-
-        Returns stdout, stderr, and return code on ALLOW.
-        Returns denial reason on DENY.
+        gov_exec functionality has been merged into gov_check.
+        Deterministic commands are now auto-executed within gov_check.
+        This tool remains for backward compatibility only.
         """
-        t0 = time.perf_counter()
-        whitelist = state.exec_whitelist
-
-        # Phase 1: always_deny (checked first — overrides everything)
-        for pattern in whitelist.get("always_deny", []):
-            if pattern in command:
-                latency_ms = (time.perf_counter() - t0) * 1000
-                return json.dumps({
-                    "decision": "DENY",
-                    "reason": f"always_deny: command contains '{pattern}'",
-                    "agent_id": agent_id,
-                    "command": command,
-                    "latency_ms": round(latency_ms, 4),
-                })
-
-        # Phase 2: allowed_prefixes whitelist
-        cmd_stripped = command.strip()
-        prefix_match = any(
-            cmd_stripped.startswith(prefix) for prefix in whitelist.get("allowed_prefixes", [])
-        )
-        if not prefix_match:
-            latency_ms = (time.perf_counter() - t0) * 1000
-            return json.dumps({
-                "decision": "DENY",
-                "reason": "command does not match any allowed prefix",
-                "agent_id": agent_id,
-                "command": command,
-                "latency_ms": round(latency_ms, 4),
-            })
-
-        # Phase 3: Y*gov contract enforcement
-        contract_result: CheckResult = check(
-            params={"command": command, "tool_name": "Bash"},
-            result={},
-            contract=state.active_contract,
-        )
-        if not contract_result.passed:
-            latency_ms = (time.perf_counter() - t0) * 1000
-            return json.dumps({
-                "decision": "DENY",
-                "reason": "Y*gov contract violation",
-                "violations": _violations_to_list(contract_result.violations),
-                "agent_id": agent_id,
-                "command": command,
-                "latency_ms": round(latency_ms, 4),
-            })
-
-        # All checks passed — execute
-        try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout_secs,
-            )
-            latency_ms = (time.perf_counter() - t0) * 1000
-            return json.dumps({
-                "decision": "ALLOW",
-                "agent_id": agent_id,
-                "command": command,
-                "returncode": proc.returncode,
-                "stdout": proc.stdout[:4096],
-                "stderr": proc.stderr[:2048],
-                "latency_ms": round(latency_ms, 4),
-            })
-        except subprocess.TimeoutExpired:
-            latency_ms = (time.perf_counter() - t0) * 1000
-            return json.dumps({
-                "decision": "ALLOW",
-                "agent_id": agent_id,
-                "command": command,
-                "returncode": -1,
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout_secs}s",
-                "latency_ms": round(latency_ms, 4),
-            })
+        return json.dumps({
+            "status": "DEPRECATED",
+            "message": "Use gov_check with tool_name='Bash' instead. "
+                       "gov_check now auto-executes deterministic commands.",
+            "migration": {
+                "old": "gov_exec(command='ls', agent_id='...')",
+                "new": "gov_check(agent_id='...', tool_name='Bash', "
+                       "params={'command': 'ls'})",
+            },
+        })
 
     # ===================================================================
     # AUDIT & OBSERVABILITY LAYER
