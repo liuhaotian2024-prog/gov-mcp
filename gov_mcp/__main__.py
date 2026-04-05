@@ -1,11 +1,29 @@
-"""Entry point: python -m gov_mcp [options]."""
+"""Entry point: python -m gov_mcp [command|options].
 
-import argparse
+Commands:
+  install    — Detect ecosystems, start server, configure clients
+  uninstall  — Stop server, remove configs
+  status     — Show server state
+  restart    — Restart server
+
+Server mode (original):
+  python -m gov_mcp --agents-md ./AGENTS.md [--transport stdio|sse] [--port N]
+"""
+
 import sys
-from pathlib import Path
 
 
 def main() -> None:
+    # Route to CLI commands if first arg is a known command
+    cli_commands = {"install", "uninstall", "status", "restart"}
+    if len(sys.argv) > 1 and sys.argv[1] in cli_commands:
+        from gov_mcp.cli import cli_main
+        sys.exit(cli_main())
+
+    # Otherwise: original server mode
+    import argparse
+    from pathlib import Path
+
     parser = argparse.ArgumentParser(description="GOV MCP — Y*gov as a standard MCP server")
     parser.add_argument("--agents-md", type=str, required=True, help="Path to AGENTS.md governance file")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio", help="MCP transport (default: stdio)")

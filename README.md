@@ -23,8 +23,7 @@ gov-mcp sits between the agent and the system. Every action is checked against a
 ### 1. Install
 
 ```bash
-pip install ystar-gov  # governance kernel
-pip install mcp        # MCP protocol
+pip install gov-mcp
 ```
 
 ### 2. Write your governance contract
@@ -37,49 +36,44 @@ Create `AGENTS.md`:
 ## Permitted: file read/write, shell commands
 ```
 
-### 3. Run
+### 3. One-command install
 
 ```bash
-python -m gov_mcp --agents-md ./AGENTS.md
+gov-mcp install
 ```
 
-### 4. Connect from your agent framework
+This will:
+1. Detect your environment (Claude Code, Cursor, Windsurf, OpenClaw)
+2. Start the GOV MCP server (background, auto port selection)
+3. Auto-configure detected clients
+4. Verify the connection
+5. Print a summary with next steps
 
-#### Claude Code (claude_desktop_config.json)
+### 4. Management commands
+
+```bash
+gov-mcp status     # Check if server is running
+gov-mcp restart    # Restart with fresh config
+gov-mcp uninstall  # Stop server, remove all configs
+```
+
+### 5. Manual setup (alternative)
+
+If you prefer manual configuration:
+
+```bash
+# Start server directly
+python -m gov_mcp --agents-md ./AGENTS.md --transport sse --port 7922
+```
+
+Connect from any MCP client:
 
 ```json
 {
   "mcpServers": {
     "gov-mcp": {
-      "command": "python",
-      "args": ["-m", "gov_mcp", "--agents-md", "/path/to/AGENTS.md"]
-    }
-  }
-}
-```
-
-#### Cursor (.cursor/mcp.json)
-
-```json
-{
-  "mcpServers": {
-    "gov-mcp": {
-      "command": "python",
-      "args": ["-m", "gov_mcp", "--agents-md", "/path/to/AGENTS.md"]
-    }
-  }
-}
-```
-
-#### Windsurf / Generic MCP Client
-
-```json
-{
-  "mcpServers": {
-    "gov-mcp": {
-      "command": "python",
-      "args": ["-m", "gov_mcp", "--agents-md", "/path/to/AGENTS.md"],
-      "transport": "stdio"
+      "url": "http://127.0.0.1:7922/sse",
+      "transport": "sse"
     }
   }
 }

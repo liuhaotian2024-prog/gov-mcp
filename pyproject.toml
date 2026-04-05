@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gov-mcp"
+version = "0.1.0"
+description = "Governed execution layer for AI agents — MCP server with Y*gov runtime enforcement"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "ystar-gov>=0.48.0",
+    "mcp>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+gov-mcp = "gov_mcp.cli:cli_main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
