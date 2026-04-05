@@ -593,10 +593,22 @@ def _try_auto_execute(
     normalized_for_check = " ".join(parts)
 
     # Contract enforcement (even auto-executed commands must pass)
+    # Same fix as gov_check: disable only_paths for Bash commands
+    if contract.only_paths:
+        exec_contract = IntentContract(
+            deny=list(contract.deny),
+            deny_commands=list(contract.deny_commands),
+            only_paths=[],
+            only_domains=list(getattr(contract, 'only_domains', [])),
+            invariant=list(getattr(contract, 'invariant', [])),
+            value_range=dict(getattr(contract, 'value_range', {})),
+        )
+    else:
+        exec_contract = contract
     contract_result: CheckResult = check(
         params={"command": normalized_for_check, "tool_name": "Bash"},
         result={},
-        contract=contract,
+        contract=exec_contract,
     )
     if not contract_result.passed:
         latency_ms = (time.perf_counter() - t0) * 1000
@@ -2777,5 +2789,142 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
             return json.dumps({"error": "No changes specified."})
 
         return gov_impact(contract_changes=changes, cieu_db=cieu_db)
+
+    @mcp.tool()
+    def gov_counterfactual(
+        hypothetical_deny: list[str] | None = None,
+        hypothetical_deny_commands: list[str] | None = None,
+        test_actions: list[dict] | None = None,
+    ) -> str:
+        """Pearl L3 counterfactual query: 'What if we had different rules?'
+
+        Runs a set of test actions against a hypothetical contract to show
+        which actions would have been blocked or allowed differently.
+
+        This enables evidence-based contract optimization:
+        'If we add /sensitive to deny, 3 out of 10 historical incidents
+        would have been prevented.'
+
+        Args:
+            hypothetical_deny: Deny rules to test (replaces current deny).
+            hypothetical_deny_commands: Command deny rules to test.
+            test_actions: List of {"tool_name": "Read", "file_path": "..."} dicts.
+                If empty, uses built-in representative scenarios.
+        """
+        t0 = time.perf_counter()
+        current = state.active_contract
+        hypothetical = IntentContract(
+            deny=hypothetical_deny or list(getattr(current, 'deny', [])),
+            deny_commands=hypothetical_deny_commands or list(getattr(current, 'deny_commands', [])),
+            only_paths=list(getattr(current, 'only_paths', [])),
+            only_domains=list(getattr(current, 'only_domains', [])),
+        )
+
+        if not test_actions:
+            test_actions = [
+                {"tool_name": "Read", "file_path": "./src/main.py"},
+                {"tool_name": "Read", "file_path": "/sensitive/data.csv"},
+                {"tool_name": "Read", "file_path": "/secret/keys.json"},
+                {"tool_name": "Bash", "command": "git status"},
+                {"tool_name": "Bash", "command": "curl http://api.internal"},
+            ]
+
+        comparisons = []
+        flipped_to_deny = 0
+        flipped_to_allow = 0
+
+        for action in test_actions:
+            r_current = check(params=action, result={}, contract=current)
+            r_hypo = check(params=action, result={}, contract=hypothetical)
+
+            current_decision = "ALLOW" if r_current.passed else "DENY"
+            hypo_decision = "ALLOW" if r_hypo.passed else "DENY"
+
+            change = "unchanged"
+            if current_decision == "ALLOW" and hypo_decision == "DENY":
+                change = "would_be_blocked"
+                flipped_to_deny += 1
+            elif current_decision == "DENY" and hypo_decision == "ALLOW":
+                change = "would_be_allowed"
+                flipped_to_allow += 1
+
+            comparisons.append({
+                "action": action,
+                "current": current_decision,
+                "hypothetical": hypo_decision,
+                "change": change,
+            })
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        return json.dumps({
+            "total_actions": len(comparisons),
+            "would_be_blocked": flipped_to_deny,
+            "would_be_allowed": flipped_to_allow,
+            "unchanged": len(comparisons) - flipped_to_deny - flipped_to_allow,
+            "comparisons": comparisons,
+            "hypothetical_contract": {
+                "deny": hypothetical.deny,
+                "deny_commands": hypothetical.deny_commands,
+            },
+            "governance": _governance_envelope(
+                state, latency_ms, tool_name="gov_counterfactual",
+            ),
+        })
+
+    @mcp.tool()
+    def gov_risk_classify(suggestion: str, target: str = "") -> str:
+        """Classify a governance suggestion as high or low risk.
+
+        Board-approved Option C: low-risk auto-activates, high-risk
+        requires Board approval via ConstraintRegistry.
+
+        High risk: deny rule changes, only_paths changes, delegation mods
+        Low risk: threshold adjustments, timeout params, log level
+
+        Args:
+            suggestion: Description of the suggested change.
+            target: Which contract field is being changed.
+        """
+        high_risk_targets = {
+            "deny", "only_paths", "deny_commands", "only_domains",
+            "delegation", "delegation_chain", "contract",
+        }
+        low_risk_targets = {
+            "threshold", "timeout", "interval", "log_level",
+            "temporal", "obligation_timing", "severity",
+        }
+
+        target_lower = target.lower()
+        suggestion_lower = suggestion.lower()
+
+        # Check target field
+        if target_lower in high_risk_targets:
+            risk = "high"
+            reason = f"Modifying '{target}' affects enforcement rules"
+        elif target_lower in low_risk_targets:
+            risk = "low"
+            reason = f"Modifying '{target}' only affects operational parameters"
+        # Check suggestion content
+        elif any(kw in suggestion_lower for kw in
+                 ["deny", "block", "restrict", "remove path", "add path",
+                  "delegation", "revoke", "new rule"]):
+            risk = "high"
+            reason = "Suggestion involves enforcement rule changes"
+        elif any(kw in suggestion_lower for kw in
+                 ["threshold", "timeout", "interval", "adjust", "tune"]):
+            risk = "low"
+            reason = "Suggestion involves parameter tuning only"
+        else:
+            risk = "high"  # Default to high when uncertain
+            reason = "Cannot determine risk level — defaulting to high (requires Board approval)"
+
+        return json.dumps({
+            "risk_level": risk,
+            "reason": reason,
+            "action": "auto_activate" if risk == "low" else "submit_to_board",
+            "suggestion": suggestion,
+            "target": target,
+            "governance": _governance_envelope(state, 0, tool_name="gov_risk_classify"),
+        })
 
     return mcp
