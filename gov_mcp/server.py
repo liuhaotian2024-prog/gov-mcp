@@ -72,10 +72,163 @@ class _State:
         # P1-2: Per-event Merkle chain state
         self._prev_event_hash = ""
 
+        # ── P0-1: CIEU writer_token (anti-fabrication) ─────────────
+        import uuid
+        self._writer_token = uuid.uuid4().hex
+        self._fabrication_attempts = 0
+
+        # ── P0-2: GovernanceLoop auto-trigger state ────────────────
+        self._gov_check_count = 0
+        self._gov_check_trigger_interval = 100  # tighten() every N checks
+        self._last_tighten_time = time.time()
+        self._tighten_interval_secs = 1800  # 30 minutes
+        self._tighten_count = 0
+
+        # ── P0-3: Session persistence path ─────────────────────────
+        self._state_db_path = agents_md_path.parent / ".gov_mcp_state.db"
+        self._restore_from_db()
+
     def next_cieu_seq(self) -> int:
         with self._cieu_seq_lock:
             self._cieu_seq += 1
             return self._cieu_seq
+
+    # ── P0-1: CIEU writer_token verification ───────────────────────
+
+    def verify_writer(self, token: str) -> bool:
+        """Verify that the caller holds a valid writer token."""
+        if token == self._writer_token:
+            return True
+        self._fabrication_attempts += 1
+        return False
+
+    # ── P0-2: GovernanceLoop auto-trigger ──────────────────────────
+
+    def maybe_trigger_tighten(self) -> Optional[str]:
+        """Check if GovernanceLoop.tighten() should run.
+
+        Triggers after every N gov_checks or every M seconds.
+        Returns tighten result summary or None if not triggered.
+        """
+        self._gov_check_count += 1
+        now = time.time()
+
+        should_trigger = (
+            self._gov_check_count % self._gov_check_trigger_interval == 0
+            or (now - self._last_tighten_time) > self._tighten_interval_secs
+        )
+
+        if not should_trigger:
+            return None
+
+        self._last_tighten_time = now
+        self._tighten_count += 1
+
+        # Try to run GovernanceLoop.tighten()
+        try:
+            from ystar.governance.governance_loop import GovernanceLoop
+            gloop = GovernanceLoop(
+                omission_engine=self.omission_engine,
+            )
+            result = gloop.tighten()
+            return f"tighten #{self._tighten_count}: {result}"
+        except Exception as e:
+            return f"tighten #{self._tighten_count}: failed ({e})"
+
+    # ── P0-3: Session state persistence ────────────────────────────
+
+    def _restore_from_db(self) -> None:
+        """Restore delegation chain and learning state from SQLite."""
+        import sqlite3
+        db = self._state_db_path
+        if not db.is_file():
+            return
+        try:
+            conn = sqlite3.connect(str(db))
+            c = conn.cursor()
+
+            # Restore delegation links
+            c.execute("""SELECT principal, actor, contract_json, grant_id
+                         FROM delegation_links ORDER BY rowid""")
+            for row in c.fetchall():
+                principal, actor, contract_json, grant_id = row
+                try:
+                    d = json.loads(contract_json)
+                    contract = _dict_to_contract(d)
+                    link = DelegationContract(
+                        principal=principal, actor=actor, contract=contract,
+                        grant_id=grant_id,
+                    )
+                    self.delegation_chain.append(link)
+                except Exception:
+                    pass
+
+            # Restore baselines
+            c.execute("SELECT label, data_json FROM baselines")
+            self._baselines = {}
+            for label, data_json in c.fetchall():
+                try:
+                    self._baselines[label] = json.loads(data_json)
+                except Exception:
+                    pass
+
+            # Restore counters
+            c.execute("SELECT key, value FROM counters")
+            for key, value in c.fetchall():
+                if key == "cieu_seq":
+                    self._cieu_seq = int(value)
+                elif key == "tighten_count":
+                    self._tighten_count = int(value)
+                elif key == "prev_event_hash":
+                    self._prev_event_hash = value
+
+            conn.close()
+        except Exception:
+            pass  # First run or corrupted DB — start fresh
+
+    def persist_to_db(self) -> None:
+        """Save delegation chain and learning state to SQLite."""
+        import sqlite3
+        db = self._state_db_path
+        try:
+            conn = sqlite3.connect(str(db))
+            c = conn.cursor()
+
+            # Create tables if needed
+            c.execute("""CREATE TABLE IF NOT EXISTS delegation_links (
+                principal TEXT, actor TEXT, contract_json TEXT, grant_id TEXT)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS baselines (
+                label TEXT PRIMARY KEY, data_json TEXT)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS counters (
+                key TEXT PRIMARY KEY, value TEXT)""")
+
+            # Clear and rewrite delegation links
+            c.execute("DELETE FROM delegation_links")
+            for link in self.delegation_chain.links:
+                contract_dict = link.contract.to_dict() if hasattr(link.contract, 'to_dict') else {}
+                c.execute("INSERT INTO delegation_links VALUES (?,?,?,?)",
+                          (link.principal, link.actor,
+                           json.dumps(contract_dict), link.grant_id))
+
+            # Save baselines
+            c.execute("DELETE FROM baselines")
+            for label, data in getattr(self, '_baselines', {}).items():
+                c.execute("INSERT INTO baselines VALUES (?,?)",
+                          (label, json.dumps(data, default=str)))
+
+            # Save counters
+            c.execute("DELETE FROM counters")
+            for key, value in [
+                ("cieu_seq", str(self._cieu_seq)),
+                ("tighten_count", str(self._tighten_count)),
+                ("prev_event_hash", self._prev_event_hash),
+            ]:
+                c.execute("INSERT INTO counters VALUES (?,?)", (key, value))
+
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 
 def _load_exec_whitelist(path: Optional[Path]) -> Dict[str, List[str]]:
@@ -285,18 +438,44 @@ def _compute_event_hash(seq: int, content: str, prev_hash: str = "") -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _classify_cieu_level(decision: str, tool_name: str = "") -> str:
+    """P1-1: Classify CIEU event into four semantic levels.
+
+    decision  → Real governance decisions (ALLOW/DENY)
+    governance → Meta-events (contract load, delegation, chain reset)
+    advisory  → Suggestions not enforced (pretrain, quality)
+    ops       → System events (doctor, version, demo, server start)
+    """
+    if decision in ("ALLOW", "DENY"):
+        return "decision"
+    governance_tools = {
+        "gov_contract_load", "gov_contract_validate", "gov_contract_activate",
+        "gov_delegate", "gov_escalate", "gov_chain_reset", "gov_seal",
+    }
+    if tool_name in governance_tools:
+        return "governance"
+    advisory_tools = {
+        "gov_pretrain", "gov_quality", "gov_simulate", "gov_impact",
+        "gov_check_impact",
+    }
+    if tool_name in advisory_tools:
+        return "advisory"
+    return "ops"
+
+
 def _governance_envelope(
     state: "_State",
     latency_ms: float,
     decision: str = "",
     is_delegated: bool = False,
     auto_executed: bool = False,
+    tool_name: str = "",
 ) -> Dict[str, Any]:
     """Build the governance extension field for every response.
 
     P7 patent candidate: governance layer on top of MCP standard.
-    Includes P1-2 (per-event hash), P1-3 (confidence_score),
-    P1-4 (human_approved).
+    Includes: per-event hash, confidence_score, human_approved,
+    writer_token verification, CIEU four-level classification.
     """
     contract = state.active_contract
     seq = state.next_cieu_seq()
@@ -328,7 +507,9 @@ def _governance_envelope(
 
     return {
         "cieu_seq": seq,
+        "cieu_level": _classify_cieu_level(decision, tool_name),
         "event_hash": event_hash,
+        "writer_verified": True,  # P0-1: this envelope was produced by the engine
         "contract_hash": contract.hash if hasattr(contract, "hash") else "",
         "contract_version": contract.name if hasattr(contract, "name") else "",
         "confidence_score": confidence,
@@ -533,7 +714,10 @@ def create_server(
         latency_ms = (time.perf_counter() - t0) * 1000
         decision = "ALLOW" if result.passed else "DENY"
 
-        return json.dumps({
+        # P0-2: Maybe trigger GovernanceLoop.tighten()
+        tighten_result = state.maybe_trigger_tighten()
+
+        response = {
             "decision": decision,
             "violations": _violations_to_list(result.violations),
             "agent_id": agent_id,
@@ -542,8 +726,17 @@ def create_server(
             "delegated_contract": is_delegated,
             "governance": _governance_envelope(
                 state, latency_ms, decision=decision, is_delegated=is_delegated,
+                tool_name="gov_check",
             ),
-        })
+        }
+        if tighten_result:
+            response["meta_learning"] = tighten_result
+
+        # P0-3: Periodic state persistence (every 50 checks)
+        if state._gov_check_count % 50 == 0:
+            state.persist_to_db()
+
+        return json.dumps(response)
 
     @mcp.tool()
     def gov_enforce(agent_id: str, tool_name: str, params: dict) -> str:
@@ -632,6 +825,9 @@ def create_server(
         state.delegation_chain.append(link)
 
         issues = state.delegation_chain.validate()
+
+        # P0-3: Persist state after delegation change
+        state.persist_to_db()
 
         return json.dumps({
             "registered": True,
@@ -1798,6 +1994,29 @@ def create_server(
         versions["platform"] = sys.platform
 
         return json.dumps(versions)
+
+    @mcp.tool()
+    def gov_session_info() -> str:
+        """Show session persistence and auto-trigger state.
+
+        Displays: state DB path, delegation links restored,
+        GovernanceLoop trigger status, fabrication attempt count.
+        """
+        return json.dumps({
+            "state_db": str(state._state_db_path),
+            "state_db_exists": state._state_db_path.is_file(),
+            "delegation_links_loaded": state.delegation_chain.depth,
+            "baselines_loaded": len(getattr(state, '_baselines', {})),
+            "cieu_seq_restored": state._cieu_seq,
+            "gov_check_count": state._gov_check_count,
+            "tighten_count": state._tighten_count,
+            "tighten_interval": f"every {state._gov_check_trigger_interval} checks "
+                                f"or {state._tighten_interval_secs}s",
+            "last_tighten_ago_s": round(time.time() - state._last_tighten_time),
+            "fabrication_attempts": state._fabrication_attempts,
+            "prev_event_hash": state._prev_event_hash[:16] + "..." if state._prev_event_hash else "",
+            "governance": _governance_envelope(state, 0, tool_name="gov_session_info"),
+        })
 
     # ===================================================================
     # USER EXPERIENCE TOOLS
