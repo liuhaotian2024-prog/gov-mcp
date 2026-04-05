@@ -66,6 +66,9 @@ class _State:
         self._cieu_seq = 0
         self._cieu_seq_lock = __import__("threading").Lock()
 
+        # Baseline storage lock (P0-4 fix: prevents race condition)
+        self._baselines_lock = __import__("threading").RLock()
+
     def next_cieu_seq(self) -> int:
         with self._cieu_seq_lock:
             self._cieu_seq += 1
@@ -195,6 +198,39 @@ def _suggest_fix(v) -> str:
         return f"Constraint '{dim}' violated. Review the corresponding rule in AGENTS.md."
 
 
+def _normalize_path(p: str) -> str:
+    """Canonicalize a path for secure comparison. Resolves ../ traversal."""
+    import os
+    return os.path.normpath(os.path.abspath(p))
+
+
+def _path_is_under(child: str, parent: str) -> bool:
+    """Check if child path is under parent, with proper boundary enforcement.
+
+    Prevents ./src_evil/ matching ./src/ (requires / boundary).
+    """
+    import os
+    nc = _normalize_path(child)
+    np = _normalize_path(parent)
+    return nc == np or nc.startswith(np + os.sep)
+
+
+def _path_matches_deny(path: str, deny_patterns: list) -> Optional[str]:
+    """Check if a path matches any deny pattern, with normalization."""
+    norm = _normalize_path(path)
+    for pattern in deny_patterns:
+        norm_pattern = _normalize_path(pattern) if pattern.startswith("/") or pattern.startswith(".") else pattern
+        if pattern.startswith("/") or pattern.startswith("."):
+            # Path-like pattern: check if path is under denied directory
+            if _path_is_under(norm, norm_pattern):
+                return pattern
+        else:
+            # String pattern: substring match (e.g., ".env")
+            if pattern.lower() in norm.lower():
+                return pattern
+    return None
+
+
 def _governance_envelope(state: "_State", latency_ms: float) -> Dict[str, Any]:
     """Build the governance extension field for every response.
 
@@ -270,9 +306,22 @@ def _try_auto_execute(
     if not ok:
         return None
 
-    # Contract enforcement (must pass even for deterministic commands)
+    # P0-5: Normalize paths in command for secure contract check
+    import os
+    normalized_command = command
+    parts = command.split()
+    for i, part in enumerate(parts):
+        if "/" in part or part.startswith("."):
+            try:
+                normalized = os.path.normpath(os.path.abspath(part))
+                parts[i] = normalized
+            except (ValueError, OSError):
+                pass
+    normalized_for_check = " ".join(parts)
+
+    # Contract enforcement (even auto-executed commands must pass)
     contract_result: CheckResult = check(
-        params={"command": command, "tool_name": "Bash"},
+        params={"command": normalized_for_check, "tool_name": "Bash"},
         result={},
         contract=contract,
     )
@@ -569,17 +618,19 @@ def create_server(
         violations: List[str] = []
 
         for path in (requested_paths or []):
-            # Principal must have this path in their allowed scope
+            # Principal must have this path in their allowed scope (P0-3 fix)
             if principal_contract.only_paths:
-                if not any(path.startswith(ap) for ap in principal_contract.only_paths):
+                if not any(_path_is_under(path, ap) for ap in principal_contract.only_paths):
                     violations.append(
                         f"Path '{path}' exceeds principal '{principal_id}' authority "
                         f"(allowed: {principal_contract.only_paths})"
                     )
-            # Path must not be in principal's deny list
-            if any(d in path for d in principal_contract.deny):
+            # Path must not be in principal's deny list (P0-1 fix)
+            matched = _path_matches_deny(path, principal_contract.deny)
+            if matched:
                 violations.append(
-                    f"Path '{path}' is denied in principal '{principal_id}' contract"
+                    f"Path '{path}' is denied in principal '{principal_id}' contract "
+                    f"(matched: '{matched}')"
                 )
 
         for cmd in (requested_commands or []):
@@ -1169,10 +1220,11 @@ def create_server(
                     if hasattr(state.active_contract, "hash") else "",
             }
 
-            # Store in server state
-            if not hasattr(state, '_baselines'):
-                state._baselines = {}
-            state._baselines[label] = baseline
+            # Store in server state (P0-4: lock-protected)
+            with state._baselines_lock:
+                if not hasattr(state, '_baselines'):
+                    state._baselines = {}
+                state._baselines[label] = baseline
 
             latency_ms = (time.perf_counter() - t0) * 1000
             baseline["governance"] = _governance_envelope(state, latency_ms)
@@ -1192,12 +1244,12 @@ def create_server(
         """
         t0 = time.perf_counter()
         try:
-            if not hasattr(state, '_baselines') or label not in state._baselines:
-                return json.dumps({
-                    "error": f"No baseline '{label}' found. Call gov_baseline first."
-                })
-
-            baseline = state._baselines[label]
+            with state._baselines_lock:
+                if not hasattr(state, '_baselines') or label not in state._baselines:
+                    return json.dumps({
+                        "error": f"No baseline '{label}' found. Call gov_baseline first."
+                    })
+                baseline = dict(state._baselines[label])  # Copy under lock
 
             # Current metrics
             cieu_store = None

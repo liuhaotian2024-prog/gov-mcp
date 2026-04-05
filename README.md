@@ -183,6 +183,17 @@ This is backward compatible — callers that don't inspect `governance` are
 unaffected. The field enables audit trails, compliance reporting, and
 contract versioning across multi-agent deployments.
 
+## A2A Integration (Coming Soon)
+
+Y*gov is designed as the governance layer for A2A (Agent-to-Agent) ecosystems.
+Every agent-to-agent communication can be audited, controlled, and proven
+compliant with CIEU five-tuple records.
+
+**Roadmap:**
+- **Phase 1 (Current):** GOV MCP — governance for MCP tool calls (33 tools, 100% coverage)
+- **Phase 2 (2026 Q3):** GOV A2A — governance layer for the A2A protocol
+- **Phase 3 (2026 Q4):** Gov Pipeline — end-to-end multi-agent workflow governance
+
 ## License
 
 MIT

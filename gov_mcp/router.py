@@ -254,12 +254,15 @@ def _check_subcommand(root: str, args_str: str, full_cmd: str) -> Optional[str]:
     if root == "git":
         # git branch -v is read-only, git branch <name> creates
         if subcmd == "branch":
-            # Read-only if: no args after flags, or just -v/-a/--list
+            # git branch (no args) or git branch -v/-a/--list = read-only
+            # git branch <name> = write (creates branch)
+            # git branch -d/-D <name> = write (deletes branch)
             non_flag = [a for a in args_parts[1:] if not a.startswith("-")]
-            flag_only = all(a in ("-v", "-a", "--list", "-r", "--merged", "--no-merged", "--verbose")
-                          for a in args_parts[1:] if a.startswith("-"))
-            if non_flag and flag_only:
-                return "git branch with name arg is a write operation"
+            has_write_flag = any(a in ("-d", "-D", "-m", "-M", "-c", "-C", "--delete",
+                                       "--move", "--copy", "--set-upstream-to")
+                                for a in args_parts[1:] if a.startswith("-"))
+            if non_flag or has_write_flag:
+                return "git branch with name/write-flag is a write operation"
 
         if subcmd in _GIT_WRITE_SUBCOMMANDS and subcmd not in _GIT_READ_SUBCOMMANDS:
             return f"git {subcmd} has write side-effects"
