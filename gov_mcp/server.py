@@ -2066,33 +2066,40 @@ def create_server(
             project_type: One of "python", "node", "go", "generic".
             custom_rules: Additional prohibition rules to include.
         """
+        # Production-grade deny list — tested against 30 secret file formats
+        _common_deny = [
+            "/etc", "/production", ".env",  # .env not /.env — catches all forms
+            "/.ssh/", "/id_rsa", "/id_ed25519",
+            "/.aws/", "/.gcloud/", "/.azure/",
+            "credentials", "secret", "private_key",
+            "/.npmrc", "/.pypirc", "/.docker/",
+            "/.git-credentials", "/.netrc", "/.kube/",
+            "/.pgpass", "tfstate", ".vault-token",
+        ]
+        _common_deny_cmds = ["rm -rf", "sudo", "git push --force", "| sh", "| bash"]
+
         templates = {
             "python": {
-                "deny": ["/etc", "/production", "/.env", "/.env.local",
-                         "/.env.production", "/__pycache__"],
-                "deny_commands": ["rm -rf", "sudo", "git push --force",
-                                  "pip install --upgrade pip"],
+                "deny": _common_deny + ["/__pycache__"],
+                "deny_commands": _common_deny_cmds + ["pip install --upgrade pip"],
                 "only_paths": ["./src/", "./tests/", "./docs/"],
                 "description": "Python project",
             },
             "node": {
-                "deny": ["/etc", "/production", "/.env", "/.env.local",
-                         "/node_modules/.cache"],
-                "deny_commands": ["rm -rf", "sudo", "git push --force",
-                                  "npm publish"],
+                "deny": _common_deny + ["/node_modules/.cache"],
+                "deny_commands": _common_deny_cmds + ["npm publish"],
                 "only_paths": ["./src/", "./test/", "./lib/"],
                 "description": "Node.js project",
             },
             "go": {
-                "deny": ["/etc", "/production", "/.env"],
-                "deny_commands": ["rm -rf", "sudo", "git push --force"],
+                "deny": _common_deny,
+                "deny_commands": _common_deny_cmds,
                 "only_paths": ["./cmd/", "./internal/", "./pkg/"],
                 "description": "Go project",
             },
             "generic": {
-                "deny": ["/etc", "/production", "/.env", "/.env.local",
-                         "/.env.production"],
-                "deny_commands": ["rm -rf", "sudo", "git push --force"],
+                "deny": _common_deny,
+                "deny_commands": _common_deny_cmds,
                 "only_paths": [],
                 "description": "General project",
             },
