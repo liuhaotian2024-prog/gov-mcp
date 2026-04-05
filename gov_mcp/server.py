@@ -2026,6 +2026,88 @@ def create_server(
         return json.dumps(versions)
 
     @mcp.tool()
+    def gov_contract_conflicts() -> str:
+        """Detect contradictions in the active governance contract.
+
+        Finds cases where deny rules block paths that only_paths allows,
+        or where deny_commands blocks commands that other rules expect.
+        Users should fix these before relying on the contract.
+        """
+        contract = state.active_contract
+        conflicts = []
+
+        # Check: deny patterns that overlap with only_paths
+        deny_list = list(getattr(contract, 'deny', []))
+        only_paths = list(getattr(contract, 'only_paths', []))
+        deny_cmds = list(getattr(contract, 'deny_commands', []))
+
+        for deny_pattern in deny_list:
+            for allowed_path in only_paths:
+                # Substring match: if deny pattern appears in allowed path
+                if deny_pattern.lower() in allowed_path.lower():
+                    conflicts.append({
+                        "type": "deny_blocks_allowed_path",
+                        "deny_pattern": deny_pattern,
+                        "allowed_path": allowed_path,
+                        "severity": "HIGH",
+                        "fix": f"Remove '{deny_pattern}' from deny OR "
+                               f"remove '{allowed_path}' from only_paths",
+                    })
+                # Reverse: allowed path appears in deny pattern
+                if allowed_path.lower() in deny_pattern.lower():
+                    conflicts.append({
+                        "type": "allowed_path_in_deny",
+                        "deny_pattern": deny_pattern,
+                        "allowed_path": allowed_path,
+                        "severity": "MEDIUM",
+                        "fix": f"Review: deny '{deny_pattern}' may block "
+                               f"files in allowed path '{allowed_path}'",
+                    })
+
+        # Check: empty contract (no protection)
+        if not deny_list and not deny_cmds:
+            conflicts.append({
+                "type": "empty_contract",
+                "severity": "HIGH",
+                "fix": "Contract has no deny rules — all actions are allowed. "
+                       "Add deny rules to AGENTS.md.",
+            })
+
+        # Check: only_paths without deny (incomplete protection)
+        if only_paths and not deny_list:
+            conflicts.append({
+                "type": "paths_without_deny",
+                "severity": "MEDIUM",
+                "fix": "only_paths restricts file access but no deny patterns "
+                       "block sensitive paths like .env or credentials.",
+            })
+
+        # Check: deny_commands too broad
+        for cmd in deny_cmds:
+            if len(cmd) <= 2:
+                conflicts.append({
+                    "type": "overly_broad_deny_command",
+                    "command": cmd,
+                    "severity": "MEDIUM",
+                    "fix": f"deny_command '{cmd}' is very short — may cause "
+                           f"false positives. Consider a longer pattern.",
+                })
+
+        return json.dumps({
+            "total_conflicts": len(conflicts),
+            "conflicts": conflicts,
+            "contract_summary": {
+                "deny_rules": len(deny_list),
+                "only_paths": len(only_paths),
+                "deny_commands": len(deny_cmds),
+            },
+            "status": "CLEAN" if len(conflicts) == 0 else "HAS_CONFLICTS",
+            "governance": _governance_envelope(
+                state, 0, tool_name="gov_contract_conflicts",
+            ),
+        })
+
+    @mcp.tool()
     def gov_session_info() -> str:
         """Show session persistence and auto-trigger state.
 
