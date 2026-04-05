@@ -88,6 +88,63 @@ class _State:
         self._state_db_path = agents_md_path.parent / ".gov_mcp_state.db"
         self._restore_from_db()
 
+        # ── P1-#2: Background obligation scanner ───────────────────
+        self._scan_interval_secs = 180  # 3 minutes
+        self._scan_thread = None
+        self._scan_stop = __import__("threading").Event()
+        self._last_scan_time = 0.0
+        self._scan_results = []
+
+    def start_background_scanner(self) -> None:
+        """Start background thread that scans for overdue obligations."""
+        import threading
+
+        def _scanner_loop():
+            while not self._scan_stop.is_set():
+                try:
+                    store = self.omission_engine.store
+                    all_obs = store.list_obligations()
+                    now = time.time()
+                    self._last_scan_time = now
+
+                    newly_overdue = []
+                    for ob in all_obs:
+                        status = str(getattr(ob.status, 'value', ob.status))
+                        due = getattr(ob, 'due_at', None)
+                        if status == 'pending' and due and due < now:
+                            # Transition to SOFT_OVERDUE
+                            from ystar.governance.omission_models import ObligationStatus
+                            ob.status = ObligationStatus.SOFT_OVERDUE
+                            ob.soft_violation_at = now
+                            store.update_obligation(ob)
+                            newly_overdue.append(ob.obligation_id)
+
+                            # Check for HARD_OVERDUE (>2x past deadline)
+                            hard_threshold = getattr(ob, 'hard_overdue_secs', 300)
+                            if (now - due) > hard_threshold:
+                                ob.status = ObligationStatus.HARD_OVERDUE
+                                store.update_obligation(ob)
+
+                    if newly_overdue:
+                        self._scan_results.append({
+                            "time": now,
+                            "newly_overdue": newly_overdue,
+                        })
+                except Exception:
+                    pass
+
+                self._scan_stop.wait(timeout=self._scan_interval_secs)
+
+        self._scan_thread = threading.Thread(
+            target=_scanner_loop, daemon=True, name="gov-mcp-scanner",
+        )
+        self._scan_thread.start()
+
+    def stop_background_scanner(self) -> None:
+        if self._scan_thread and self._scan_thread.is_alive():
+            self._scan_stop.set()
+            self._scan_thread.join(timeout=5)
+
     def next_cieu_seq(self) -> int:
         with self._cieu_seq_lock:
             self._cieu_seq += 1
@@ -704,6 +761,33 @@ def create_server(
         command = params.get("command", "")
         effective_contract = _get_contract_for_agent(agent_id, state)
         is_delegated = effective_contract is not state.active_contract
+
+        # ── P1-#6: HARD_OVERDUE blocks new operations ─────────────
+        try:
+            om_store = state.omission_engine.store
+            all_obs = om_store.list_obligations(actor_id=agent_id)
+            hard_overdue = [
+                o for o in all_obs
+                if str(getattr(o.status, 'value', o.status)) == 'hard_overdue'
+            ]
+            if hard_overdue:
+                latency_ms = (time.perf_counter() - t0) * 1000
+                overdue_ids = [o.obligation_id for o in hard_overdue[:3]]
+                return json.dumps({
+                    "decision": "DENY",
+                    "reason": "HARD_OVERDUE obligations must be completed first",
+                    "overdue_obligations": overdue_ids,
+                    "overdue_count": len(hard_overdue),
+                    "agent_id": agent_id,
+                    "tool_name": tool_name,
+                    "auto_executed": False,
+                    "governance": _governance_envelope(
+                        state, latency_ms, decision="DENY",
+                        tool_name="gov_check",
+                    ),
+                })
+        except Exception:
+            pass  # Omission store not available — continue
 
         # ── Bash commands: check + auto-execute if deterministic ────
         if tool_name == "Bash" and command:
@@ -1509,10 +1593,17 @@ def create_server(
             failed.append(f"L1.09: delegation chain invalid ({len(chain_issues)} issues)")
 
         # 10. Governance heartbeat
+        scanner_alive = (state._scan_thread is not None and
+                         state._scan_thread.is_alive())
+        last_scan_ago = round(time.time() - state._last_scan_time) if state._last_scan_time > 0 else None
         checks["L1_10_heartbeat"] = {
             "cieu_seq": state._cieu_seq,
             "prev_event_hash": state._prev_event_hash[:16] + "..." if state._prev_event_hash else "",
             "server_uptime_events": state._cieu_seq,
+            "obligation_scanner": "RUNNING" if scanner_alive else "STOPPED",
+            "scanner_interval_secs": state._scan_interval_secs,
+            "last_scan_ago_secs": last_scan_ago,
+            "recent_scan_results": len(state._scan_results),
             "status": "ALIVE" if state._cieu_seq > 0 else "NO_ACTIVITY",
         }
 
@@ -3015,5 +3106,8 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
             "target": target,
             "governance": _governance_envelope(state, 0, tool_name="gov_risk_classify"),
         })
+
+    # Start background obligation scanner
+    state.start_background_scanner()
 
     return mcp
