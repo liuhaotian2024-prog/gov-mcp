@@ -706,10 +706,28 @@ def create_server(
         check_params = _normalize_params_for_value_range(
             {"tool_name": tool_name, **params}, effective_contract,
         )
+        # Layer 1 fix: Bash commands should be checked by deny_commands,
+        # NOT by only_paths. The kernel's _classify_by_value() wrongly
+        # treats "cat ./src/main.py" as a path and fails only_paths check.
+        # Fix: temporarily remove only_paths for Bash commands, since Bash
+        # security is handled entirely by deny_commands.
+        # Layer 1 fix: Bash commands checked by deny/deny_commands only,
+        # not only_paths (prevents "cat ./src/main.py" false positive).
+        if tool_name == "Bash" and effective_contract.only_paths:
+            check_contract = IntentContract(
+                deny=list(effective_contract.deny),
+                deny_commands=list(effective_contract.deny_commands),
+                only_paths=[],  # Bash uses deny_commands, not only_paths
+                only_domains=list(getattr(effective_contract, 'only_domains', [])),
+                invariant=list(getattr(effective_contract, 'invariant', [])),
+                value_range=dict(getattr(effective_contract, 'value_range', {})),
+            )
+        else:
+            check_contract = effective_contract
         result: CheckResult = check(
             params=check_params,
             result={},
-            contract=effective_contract,
+            contract=check_contract,
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         decision = "ALLOW" if result.passed else "DENY"
