@@ -1,0 +1,63 @@
+{
+  "scenario_1": {
+    "scenario": "1 - Financial (FINRA)",
+    "checklist": {
+      "complete_behavior_record": "PASS",
+      "timestamp_precision": "PASS",
+      "tamper_proof": "PARTIAL",
+      "person_traceable": "PASS"
+    },
+    "records": 6,
+    "deny_count": 3,
+    "gaps": [
+      "No automatic per-event Merkle hashing (batch seal only)",
+      "No COSO five-element report template",
+      "agent_id needs mapping to FINRA CRD number"
+    ]
+  },
+  "scenario_2": {
+    "scenario": "2 - Healthcare (EU AI Act)",
+    "checklist": {
+      "output_interpretability": "PARTIAL",
+      "human_override": "PASS",
+      "stop_button": "PASS",
+      "approval_record": "PASS",
+      "error_correction": "PARTIAL"
+    },
+    "records": 5,
+    "gaps": [
+      "No confidence_score field in governance response",
+      "No 'human_approved' field for high-risk ALLOW decisions",
+      "No automatic rollback mechanism for incorrect AI outputs",
+      "No ISO 13485 QMS template"
+    ]
+  },
+  "scenario_4": {
+    "scenario": "4 - Legal (Multi-Tenant)",
+    "total_checks": 1000,
+    "agents": 50,
+    "clients": 10,
+    "cross_client_leaks": 0,
+    "traversal_leaks": 0,
+    "system_leaks": 0,
+    "false_positives": 0,
+    "secure": true,
+    "gaps": [
+      "No per-client encryption key support",
+      "No attorney-client privilege field",
+      "Isolation depends on correct only_paths config (human error risk)"
+    ]
+  },
+  "scenario_5": {
+    "scenario": "5 - Manufacturing (SAP)",
+    "numeric_correct": 8,
+    "numeric_total": 8,
+    "string_formats_enforced": true,
+    "gaps": [
+      "String amounts bypass value_range (need parsing layer)",
+      "No currency unit support (USD/EUR/CNY)",
+      "No comma-separated number parsing ($50,000)",
+      "Non-MCP ERP integration requires custom adapter"
+    ]
+  }
+}
