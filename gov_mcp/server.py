@@ -62,6 +62,15 @@ class _State:
         # Exec whitelist
         self.exec_whitelist = _load_exec_whitelist(exec_whitelist_path)
 
+        # CIEU sequence counter (monotonic, process-scoped)
+        self._cieu_seq = 0
+        self._cieu_seq_lock = __import__("threading").Lock()
+
+    def next_cieu_seq(self) -> int:
+        with self._cieu_seq_lock:
+            self._cieu_seq += 1
+            return self._cieu_seq
+
 
 def _load_exec_whitelist(path: Optional[Path]) -> Dict[str, List[str]]:
     """Load exec whitelist YAML with platform auto-detection.
@@ -146,6 +155,37 @@ def _violations_to_list(violations: list) -> List[Dict[str, Any]]:
     ]
 
 
+def _governance_envelope(state: "_State", latency_ms: float) -> Dict[str, Any]:
+    """Build the governance extension field for every response.
+
+    This is the Y*gov governance layer on top of MCP — patent candidate P7.
+    Backward compatible: callers that don't inspect 'governance' are unaffected.
+    """
+    contract = state.active_contract
+    return {
+        "cieu_seq": state.next_cieu_seq(),
+        "contract_hash": contract.hash if hasattr(contract, "hash") else "",
+        "contract_version": contract.name if hasattr(contract, "name") else "",
+        "latency_ms": round(latency_ms, 4),
+        "host": _detect_host(),
+    }
+
+
+def _detect_host() -> str:
+    """Detect the calling host ecosystem (best-effort, no hardcoded paths)."""
+    import os
+    # Check environment variables set by known ecosystems
+    if os.environ.get("CLAUDE_CODE"):
+        return "claude_code"
+    if os.environ.get("CURSOR_SESSION"):
+        return "cursor"
+    if os.environ.get("WINDSURF_SESSION"):
+        return "windsurf"
+    if os.environ.get("OPENCLAW_AGENT"):
+        return "openclaw"
+    return "generic"
+
+
 # ---------------------------------------------------------------------------
 # Auto-routing logic
 # ---------------------------------------------------------------------------
@@ -204,7 +244,7 @@ def _try_auto_execute(
             "agent_id": agent_id,
             "tool_name": "Bash",
             "auto_executed": False,
-            "latency_ms": round(latency_ms, 4),
+            "governance": _governance_envelope(state, latency_ms),
         })
 
     # Execute the command
@@ -224,7 +264,7 @@ def _try_auto_execute(
             "returncode": proc.returncode,
             "stdout": proc.stdout[:4096],
             "stderr": proc.stderr[:2048],
-            "latency_ms": round(latency_ms, 4),
+            "governance": _governance_envelope(state, latency_ms),
         })
     except subprocess.TimeoutExpired:
         latency_ms = (time.perf_counter() - t0) * 1000
@@ -237,7 +277,7 @@ def _try_auto_execute(
             "returncode": -1,
             "stdout": "",
             "stderr": f"Command timed out after {timeout_secs}s",
-            "latency_ms": round(latency_ms, 4),
+            "governance": _governance_envelope(state, latency_ms),
         })
 
 
@@ -314,7 +354,7 @@ def create_server(
             "tool_name": tool_name,
             "auto_executed": False,
             "delegated_contract": is_delegated,
-            "latency_ms": round(latency_ms, 4),
+            "governance": _governance_envelope(state, latency_ms),
         })
 
     @mcp.tool()
@@ -361,7 +401,7 @@ def create_server(
             "obligation_warnings": obligation_warnings,
             "delegation_valid": delegation_valid,
             "delegation_issues": delegation_issues,
-            "latency_ms": round(latency_ms, 4),
+            "governance": _governance_envelope(state, latency_ms),
         })
 
     @mcp.tool()

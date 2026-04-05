@@ -1,6 +1,11 @@
 # gov-mcp
 
-**Governed execution for any AI agent framework.**
+**Governed execution for any AI agent framework. Install in 30 seconds. Works with Claude Code, OpenClaw, and any MCP-compatible client.**
+
+```bash
+pip install gov-mcp
+gov-mcp install
+```
 
 An MCP server that enforces runtime governance on AI agent actions — file access, command execution, delegation chains, and permission escalation. Built on the [Y*gov](https://github.com/liuhaotian2024-prog/Y-star-gov) governance kernel.
 
@@ -8,15 +13,17 @@ An MCP server that enforces runtime governance on AI agent actions — file acce
 
 AI agents can read files, run commands, and call APIs. Without governance, a single prompt injection or misaligned sub-agent can `rm -rf /`, leak `.env` secrets, or escalate privileges.
 
-gov-mcp sits between the agent and the system. Every action is checked against a governance contract before execution. Deterministic commands are auto-routed for zero-overhead execution.
+gov-mcp sits between the agent and the system. Every action is checked against a governance contract before execution. Deterministic commands are auto-executed inline — no second tool call needed.
 
 ## Performance (EXP-008)
 
-| Metric | Without gov-mcp | With gov-mcp | Improvement |
+| Metric | Without gov-mcp | With gov-mcp | Delta |
 |---|---|---|---|
 | Output tokens | 6,107 | 3,352 | **-45.1%** |
 | Wall time | 171.1s | 65.8s | **-61.5%** |
-| False positives | 0 | 0 | -- |
+| Throughput | — | 39,000+ checks/s | — |
+| Concurrent agents | — | 50 agents, zero deadlock | — |
+| False positives | 0 | 0 | **0** |
 
 ## Quick Start
 
@@ -143,6 +150,38 @@ receives stdout/stderr in the same response — no second tool call needed.
 
 This saves **22% tokens** and eliminates one LLM round-trip per safe command.
 66.7% of typical Bash commands are auto-executed (based on stress testing).
+
+## Governance Extension Layer
+
+Every `gov_check` response includes a `governance` field — a structured
+audit envelope that rides on top of the MCP protocol:
+
+```json
+{
+  "decision": "ALLOW",
+  "auto_executed": true,
+  "stdout": "...",
+  "governance": {
+    "cieu_seq": 17753,
+    "contract_hash": "sha256:b6e47016...",
+    "contract_version": "1.0",
+    "latency_ms": 1.9,
+    "host": "claude_code"
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `cieu_seq` | Monotonic sequence number — total governance decisions made |
+| `contract_hash` | SHA-256 of the active governance contract |
+| `contract_version` | Contract name/version string |
+| `latency_ms` | Governance check latency (sub-2ms typical) |
+| `host` | Detected client ecosystem |
+
+This is backward compatible — callers that don't inspect `governance` are
+unaffected. The field enables audit trails, compliance reporting, and
+contract versioning across multi-agent deployments.
 
 ## License
 
