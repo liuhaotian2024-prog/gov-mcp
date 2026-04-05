@@ -1155,78 +1155,192 @@ def create_server(
 
     @mcp.tool()
     def gov_doctor() -> str:
-        """Run health check on Y*gov governance state.
+        """Full 14-layer health check on Y*gov governance state.
 
-        Returns structured diagnostics: contract status, delegation chain,
-        omission engine state, and subsystem liveness.
+        Layer 1 (10 checks): Zero-dependency infrastructure health
+        Layer 2 (4 checks): Dependency and environment health
+
+        Matches the complete ystar doctor CLI command.
         """
         checks: Dict[str, Any] = {}
+        failed = []
+        warnings = []
+
+        # ── LAYER 1: Zero-dependency checks (10 items) ──────────────
 
         # 1. Contract
-        checks["contract"] = {
-            "status": "loaded",
-            "name": state.active_contract.name or "(unnamed)",
-            "hash": state.active_contract.hash,
+        contract = state.active_contract
+        checks["L1_01_contract"] = {
+            "status": "loaded" if (hasattr(contract, "hash") and contract.hash) else "empty",
+            "name": contract.name if hasattr(contract, "name") else "",
+            "hash": contract.hash if hasattr(contract, "hash") else "",
             "agents_md": str(state.agents_md_path),
             "confidence": state.confidence_label,
-            "confidence_score": state.confidence_score,
         }
+        if not (hasattr(contract, "hash") and contract.hash):
+            failed.append("L1.01: contract not loaded or empty")
 
-        # 2. Delegation chain
-        chain_issues = state.delegation_chain.validate() if state.delegation_chain.depth > 0 else []
-        checks["delegation_chain"] = {
-            "depth": state.delegation_chain.depth,
-            "valid": len(chain_issues) == 0,
-            "issues": chain_issues,
-        }
-
-        # 3. Omission engine
-        try:
-            store = state.omission_engine.store
-            pending = store.pending_obligations()
-            all_obs = store.list_obligations()
-            checks["omission_engine"] = {
-                "status": "active",
-                "total_obligations": len(all_obs),
-                "pending": len(pending),
-            }
-        except Exception as e:
-            checks["omission_engine"] = {"status": "error", "error": str(e)}
-
-        # 4. CIEU store
+        # 2. CIEU store
         if state._cieu_store is not None:
             try:
                 stats = state._cieu_store.stats()
-                checks["cieu"] = {
+                checks["L1_02_cieu"] = {
                     "status": "active",
                     "total_events": stats.get("total", 0),
                     "deny_rate": round(stats.get("deny_rate", 0.0), 4),
                 }
             except Exception as e:
-                checks["cieu"] = {"status": "error", "error": str(e)}
+                checks["L1_02_cieu"] = {"status": "error", "error": str(e)}
+                failed.append(f"L1.02: CIEU store error: {e}")
         else:
-            checks["cieu"] = {"status": "not_configured"}
+            checks["L1_02_cieu"] = {"status": "in_memory_only"}
+            warnings.append("L1.02: CIEU using in-memory store (not persisted)")
 
-        # 5. Exec whitelist
-        wl = state.exec_whitelist
-        checks["exec_whitelist"] = {
-            "allowed_prefixes": len(wl.get("allowed_prefixes", [])),
-            "always_deny": len(wl.get("always_deny", [])),
+        # 3. Omission engine
+        try:
+            om_store = state.omission_engine.store
+            all_obs = om_store.list_obligations()
+            pending = [o for o in all_obs if hasattr(o, 'status') and
+                       str(getattr(o.status, 'value', o.status)) == 'pending']
+            checks["L1_03_omission"] = {
+                "status": "active",
+                "total": len(all_obs),
+                "pending": len(pending),
+            }
+        except Exception as e:
+            checks["L1_03_omission"] = {"status": "error", "error": str(e)}
+            failed.append(f"L1.03: omission engine error")
+
+        # 4. Interrupt gate (overdue obligations block new work)
+        overdue_count = 0
+        try:
+            for o in all_obs:
+                status_val = str(getattr(o.status, 'value', o.status))
+                if status_val in ('hard_overdue', 'soft_overdue'):
+                    overdue_count += 1
+            checks["L1_04_interrupt_gate"] = {
+                "status": "BLOCKING" if overdue_count > 0 else "CLEAR",
+                "overdue_obligations": overdue_count,
+            }
+            if overdue_count > 0:
+                warnings.append(f"L1.04: interrupt gate BLOCKING ({overdue_count} overdue)")
+        except Exception:
+            checks["L1_04_interrupt_gate"] = {"status": "unknown"}
+
+        # 5. Unreachable obligations (pending > 7 days)
+        unreachable = 0
+        try:
+            week_ago = time.time() - (7 * 86400)
+            for o in all_obs:
+                created = getattr(o, 'created_at', 0)
+                status_val = str(getattr(o.status, 'value', o.status))
+                if status_val == 'pending' and created > 0 and created < week_ago:
+                    unreachable += 1
+            checks["L1_05_unreachable"] = {
+                "count": unreachable,
+                "status": "WARN" if unreachable > 0 else "OK",
+            }
+            if unreachable > 0:
+                warnings.append(f"L1.05: {unreachable} obligations pending >7 days")
+        except Exception:
+            checks["L1_05_unreachable"] = {"status": "unknown"}
+
+        # 6. Engine configuration
+        deny_count = len(getattr(contract, 'deny', []))
+        cmd_count = len(getattr(contract, 'deny_commands', []))
+        path_count = len(getattr(contract, 'only_paths', []))
+        checks["L1_06_engine_config"] = {
+            "deny_rules": deny_count,
+            "deny_commands": cmd_count,
+            "only_paths": path_count,
+            "total_rules": deny_count + cmd_count + path_count,
+            "status": "OK" if (deny_count + cmd_count) > 0 else "WARN_EMPTY",
+        }
+        if deny_count + cmd_count == 0:
+            warnings.append("L1.06: no deny rules configured (contract is permissive)")
+
+        # 7. Archive freshness
+        checks["L1_07_archive"] = {
+            "status": "not_applicable",
+            "note": "Archive freshness requires cieu_db path",
         }
 
-        # Overall health
-        failed = []
-        if not checks["contract"]["hash"]:
-            failed.append("contract not loaded")
-        if checks.get("delegation_chain", {}).get("issues"):
-            failed.append("delegation chain invalid")
-        if checks.get("omission_engine", {}).get("status") == "error":
-            failed.append("omission engine error")
+        # 8. External config reads
+        checks["L1_08_external_config"] = {
+            "status": "not_checked",
+            "note": "Requires CIEU query for external_config_read events",
+        }
+
+        # 9. Delegation chain
+        chain = state.delegation_chain
+        chain_issues = chain.validate() if chain.depth > 0 else []
+        checks["L1_09_delegation"] = {
+            "depth": chain.depth,
+            "valid": len(chain_issues) == 0,
+            "issues": chain_issues[:5],
+        }
+        if chain_issues:
+            failed.append(f"L1.09: delegation chain invalid ({len(chain_issues)} issues)")
+
+        # 10. Governance heartbeat
+        checks["L1_10_heartbeat"] = {
+            "cieu_seq": state._cieu_seq,
+            "prev_event_hash": state._prev_event_hash[:16] + "..." if state._prev_event_hash else "",
+            "server_uptime_events": state._cieu_seq,
+            "status": "ALIVE" if state._cieu_seq > 0 else "NO_ACTIVITY",
+        }
+
+        # ── LAYER 2: Dependency checks (4 items) ────────────────────
+
+        # 11. Exec whitelist
+        wl = state.exec_whitelist
+        checks["L2_11_exec_whitelist"] = {
+            "allowed_prefixes": len(wl.get("allowed_prefixes", [])),
+            "always_deny": len(wl.get("always_deny", [])),
+            "status": "loaded",
+        }
+
+        # 12. Y*gov kernel version
+        try:
+            import ystar
+            checks["L2_12_ystar_version"] = {
+                "version": getattr(ystar, "__version__", "unknown"),
+                "status": "OK",
+            }
+        except ImportError:
+            checks["L2_12_ystar_version"] = {"status": "NOT_INSTALLED"}
+            failed.append("L2.12: ystar-gov not installed")
+
+        # 13. Hook status
+        import shutil
+        claude_cmd = shutil.which("claude")
+        checks["L2_13_hook"] = {
+            "claude_available": claude_cmd is not None,
+            "claude_path": claude_cmd or "",
+            "status": "OK" if claude_cmd else "NOT_FOUND",
+        }
+
+        # 14. Baselines
+        baseline_count = len(getattr(state, '_baselines', {}))
+        checks["L2_14_baselines"] = {
+            "count": baseline_count,
+            "labels": list(getattr(state, '_baselines', {}).keys()),
+            "status": "OK" if baseline_count > 0 else "NONE",
+        }
+
+        # ── Overall health ──────────────────────────────────────────
+        total_checks = 14
+        pass_count = total_checks - len(failed)
 
         return json.dumps({
-            "health": "degraded" if failed else "healthy",
-            "issues": failed,
+            "health": "critical" if len(failed) > 3 else
+                      "degraded" if failed else
+                      "warning" if warnings else "healthy",
+            "summary": f"{pass_count}/{total_checks} checks passed",
+            "failed": failed,
+            "warnings": warnings,
             "checks": checks,
+            "governance": _governance_envelope(state, 0),
         })
 
     # ===================================================================

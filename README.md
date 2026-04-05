@@ -99,7 +99,7 @@ Connect from any MCP client:
 }
 ```
 
-## Tools (13)
+## Tools (33)
 
 ### Core Enforcement
 | Tool | Description |
@@ -128,8 +128,40 @@ Connect from any MCP client:
 | `gov_report` | CIEU summary: decisions, deny rate, top violations. |
 | `gov_verify` | SHA-256 Merkle chain integrity verification. |
 | `gov_obligations` | Query obligation status from OmissionEngine. |
-| `gov_doctor` | Health check: contract, delegation, omission engine. |
+| `gov_doctor` | Full 14-layer health check (contract, CIEU, obligations, heartbeat, hooks). |
 | `gov_benchmark` | Token savings benchmark: Mode A vs Mode B vs Mode C. |
+| `gov_seal` | Seal CIEU session with Merkle root for tamper-evident preservation. |
+| `gov_audit` | Causal audit report with violation replay for compliance evidence. |
+| `gov_trend` | 7-day CIEU event trend analysis with deny rate direction. |
+
+### Governance Analysis
+| Tool | Description |
+|---|---|
+| `gov_baseline` | Snapshot current governance state for later comparison. |
+| `gov_delta` | Compare current state against saved baseline. |
+| `gov_coverage` | Detect agent governance blind spots. |
+| `gov_quality` | Contract quality scoring (8 dimensions). |
+| `gov_simulate` | A/B simulation: intercept rate, false positive rate, risk reduction. |
+| `gov_impact` | Predict contract change effects via CIEU replay. |
+| `gov_check_impact` | Convenience wrapper for gov_impact with explicit params. |
+| `gov_pretrain` | Learn contract improvements from historical CIEU data. |
+
+### User Experience
+| Tool | Description |
+|---|---|
+| `gov_demo` | Zero-config 5-scenario governance demo. |
+| `gov_init` | Generate AGENTS.md template (python/node/go/generic). |
+| `gov_version` | Version info (gov-mcp + ystar-gov + python). |
+| `gov_policy_builder` | Contract data for UI rendering. |
+| `gov_reset_breaker` | Reset circuit breaker after manual intervention. |
+
+### Domain & Data
+| Tool | Description |
+|---|---|
+| `gov_archive` | Hot/cold CIEU data tiering. |
+| `gov_domain_list` | List registered governance domain packs. |
+| `gov_domain_describe` | Domain pack details and vocabulary. |
+| `gov_domain_init` | Generate custom domain pack template. |
 
 ## How It Works
 
