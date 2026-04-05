@@ -184,9 +184,12 @@ class _State:
         # Try to run GovernanceLoop.tighten()
         try:
             from ystar.governance.governance_loop import GovernanceLoop
-            gloop = GovernanceLoop(
-                omission_engine=self.omission_engine,
+            from ystar.governance.reporting import ReportEngine
+            report_engine = ReportEngine(
+                omission_store=self.omission_engine.store,
+                cieu_store=self._cieu_store,
             )
+            gloop = GovernanceLoop(report_engine=report_engine)
             result = gloop.tighten()
             return f"tighten #{self._tighten_count}: {result}"
         except Exception as e:
