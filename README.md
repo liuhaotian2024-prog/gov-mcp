@@ -99,7 +99,7 @@ Connect from any MCP client:
 }
 ```
 
-## Tools (33)
+## Tools (38)
 
 ### Core Enforcement
 | Tool | Description |
