@@ -141,9 +141,10 @@ def _get_contract_for_agent(agent_id: str, state: "_State") -> IntentContract:
 
 
 def _violations_to_list(violations: list) -> List[Dict[str, Any]]:
-    """Serialize Violation dataclass instances to plain dicts."""
-    return [
-        {
+    """Serialize Violation dataclass instances to plain dicts with fix suggestions."""
+    results = []
+    for v in violations:
+        entry: Dict[str, Any] = {
             "dimension": v.dimension,
             "field": v.field,
             "message": v.message,
@@ -151,8 +152,47 @@ def _violations_to_list(violations: list) -> List[Dict[str, Any]]:
             "constraint": v.constraint,
             "severity": v.severity,
         }
-        for v in violations
-    ]
+        # Readable fix suggestion
+        entry["fix_suggestion"] = _suggest_fix(v)
+        results.append(entry)
+    return results
+
+
+def _suggest_fix(v) -> str:
+    """Generate a human-readable fix suggestion for a violation."""
+    dim = v.dimension
+    actual = str(v.actual) if v.actual is not None else ""
+    constraint = v.constraint or ""
+
+    if dim == "deny":
+        # Extract the denied pattern
+        pattern = ""
+        if "'" in constraint:
+            pattern = constraint.split("'")[1]
+        return (
+            f"'{actual}' is blocked because '{pattern}' is in the deny list. "
+            f"To allow this, remove '{pattern}' from the deny list in AGENTS.md."
+        )
+    elif dim == "deny_commands":
+        cmd = ""
+        if "'" in constraint:
+            cmd = constraint.split("'")[1]
+        return (
+            f"Command blocked: '{cmd}' is prohibited. "
+            f"To allow this command, remove '{cmd}' from deny_commands in AGENTS.md."
+        )
+    elif dim == "only_paths":
+        return (
+            f"Path '{actual}' is outside allowed paths. "
+            f"To allow this path, add it to the only_paths list in AGENTS.md."
+        )
+    elif dim == "only_domains":
+        return (
+            f"Domain not in allowlist. "
+            f"To allow this domain, add it to only_domains in AGENTS.md."
+        )
+    else:
+        return f"Constraint '{dim}' violated. Review the corresponding rule in AGENTS.md."
 
 
 def _governance_envelope(state: "_State", latency_ms: float) -> Dict[str, Any]:
@@ -1058,5 +1098,539 @@ def create_server(
 
         result = run_benchmark(tasks=tasks)
         return json.dumps(result)
+
+    # ===================================================================
+    # NEW TOOLS — FUNCTIONALITY PARITY WITH Y-star-gov CLI
+    # ===================================================================
+
+    @mcp.tool()
+    def gov_seal(cieu_db: str, session_id: str) -> str:
+        """Seal a CIEU session with Merkle root for tamper-evident preservation.
+
+        Must be called before gov_verify for meaningful integrity checks.
+        Once sealed, new events in that session invalidate the seal.
+
+        Args:
+            cieu_db: Path to CIEU database.
+            session_id: Session to seal.
+        """
+        try:
+            from ystar.governance.cieu_store import CIEUStore
+            store = CIEUStore(cieu_db)
+            result = store.seal_session(session_id)
+            return json.dumps({
+                "status": "sealed",
+                "session_id": result.get("session_id", session_id),
+                "event_count": result.get("event_count", 0),
+                "merkle_root": result.get("merkle_root", ""),
+                "sealed_at": result.get("sealed_at", 0),
+                "governance": _governance_envelope(state, 0),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_baseline(cieu_db: str = "", label: str = "snapshot") -> str:
+        """Capture current governance state as a baseline snapshot.
+
+        Use gov_delta later to compare changes against this baseline.
+        The baseline is stored in server memory for the session lifetime.
+
+        Args:
+            cieu_db: Path to CIEU database. Empty uses in-process state.
+            label: Label for this baseline (default: "snapshot").
+        """
+        t0 = time.perf_counter()
+        try:
+            cieu_store = None
+            if cieu_db:
+                from ystar.governance.cieu_store import CIEUStore
+                cieu_store = CIEUStore(cieu_db)
+            else:
+                cieu_store = state._cieu_store
+
+            # Capture metrics
+            stats = cieu_store.stats() if cieu_store else {}
+            omission_store = state.omission_engine.store
+            all_obs = omission_store.list_obligations()
+            pending = [o for o in all_obs if hasattr(o, 'status') and
+                       str(getattr(o.status, 'value', o.status)) == 'pending']
+
+            baseline = {
+                "label": label,
+                "timestamp": time.time(),
+                "cieu_total": stats.get("total", 0),
+                "cieu_deny_rate": stats.get("deny_rate", 0),
+                "cieu_by_decision": stats.get("by_decision", {}),
+                "obligations_total": len(all_obs),
+                "obligations_pending": len(pending),
+                "delegation_depth": state.delegation_chain.depth,
+                "contract_hash": state.active_contract.hash
+                    if hasattr(state.active_contract, "hash") else "",
+            }
+
+            # Store in server state
+            if not hasattr(state, '_baselines'):
+                state._baselines = {}
+            state._baselines[label] = baseline
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            baseline["governance"] = _governance_envelope(state, latency_ms)
+            return json.dumps(baseline)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_delta(label: str = "snapshot", cieu_db: str = "") -> str:
+        """Compare current governance state against a saved baseline.
+
+        Call gov_baseline first to create the baseline.
+
+        Args:
+            label: Baseline label to compare against (default: "snapshot").
+            cieu_db: Path to CIEU database. Empty uses in-process state.
+        """
+        t0 = time.perf_counter()
+        try:
+            if not hasattr(state, '_baselines') or label not in state._baselines:
+                return json.dumps({
+                    "error": f"No baseline '{label}' found. Call gov_baseline first."
+                })
+
+            baseline = state._baselines[label]
+
+            # Current metrics
+            cieu_store = None
+            if cieu_db:
+                from ystar.governance.cieu_store import CIEUStore
+                cieu_store = CIEUStore(cieu_db)
+            else:
+                cieu_store = state._cieu_store
+
+            stats = cieu_store.stats() if cieu_store else {}
+            omission_store = state.omission_engine.store
+            all_obs = omission_store.list_obligations()
+            pending = [o for o in all_obs if hasattr(o, 'status') and
+                       str(getattr(o.status, 'value', o.status)) == 'pending']
+
+            current = {
+                "cieu_total": stats.get("total", 0),
+                "cieu_deny_rate": stats.get("deny_rate", 0),
+                "obligations_total": len(all_obs),
+                "obligations_pending": len(pending),
+                "delegation_depth": state.delegation_chain.depth,
+            }
+
+            def _delta(key):
+                b = baseline.get(key, 0)
+                c = current.get(key, 0)
+                d = c - b if isinstance(c, (int, float)) else 0
+                direction = "up" if d > 0 else ("down" if d < 0 else "unchanged")
+                return {"baseline": b, "current": c, "delta": d, "direction": direction}
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "baseline_label": label,
+                "baseline_timestamp": baseline.get("timestamp", 0),
+                "current_timestamp": time.time(),
+                "deltas": {
+                    "cieu_total": _delta("cieu_total"),
+                    "cieu_deny_rate": _delta("cieu_deny_rate"),
+                    "obligations_total": _delta("obligations_total"),
+                    "obligations_pending": _delta("obligations_pending"),
+                    "delegation_depth": _delta("delegation_depth"),
+                },
+                "contract_changed": (
+                    baseline.get("contract_hash", "") !=
+                    (state.active_contract.hash
+                     if hasattr(state.active_contract, "hash") else "")
+                ),
+                "governance": _governance_envelope(state, latency_ms),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_audit(
+        cieu_db: str = "",
+        session_id: str = "",
+        agent_id: str = "",
+        decision: str = "",
+        limit: int = 20,
+    ) -> str:
+        """Causal audit report: intent vs actual actions with violation replay.
+
+        Returns detailed CIEU event records for compliance evidence
+        generation and forensic analysis.
+
+        Args:
+            cieu_db: Path to CIEU database.
+            session_id: Filter by session.
+            agent_id: Filter by agent.
+            decision: Filter by decision (allow/deny/escalate).
+            limit: Max records to return (default 20).
+        """
+        t0 = time.perf_counter()
+        try:
+            cieu_store = None
+            if cieu_db:
+                from ystar.governance.cieu_store import CIEUStore
+                cieu_store = CIEUStore(cieu_db)
+            else:
+                cieu_store = state._cieu_store
+
+            if cieu_store is None:
+                return json.dumps({"error": "No CIEU store. Pass cieu_db path."})
+
+            # Query events
+            kwargs = {"limit": limit}
+            if session_id:
+                kwargs["session_id"] = session_id
+            if agent_id:
+                kwargs["agent_id"] = agent_id
+            if decision:
+                kwargs["decision"] = decision
+
+            events = cieu_store.query(**kwargs)
+
+            records = []
+            for ev in events:
+                record = {
+                    "event_id": getattr(ev, "event_id", ""),
+                    "timestamp": getattr(ev, "created_at", 0),
+                    "session_id": getattr(ev, "session_id", ""),
+                    "agent_id": getattr(ev, "agent_id", ""),
+                    "decision": getattr(ev, "decision", ""),
+                    "violations": getattr(ev, "violations", []),
+                    "file_path": getattr(ev, "file_path", ""),
+                    "command": getattr(ev, "command", ""),
+                }
+                records.append(record)
+
+            # Summary
+            stats = cieu_store.stats()
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            return json.dumps({
+                "total_matched": len(records),
+                "records": records,
+                "summary": {
+                    "total_events": stats.get("total", 0),
+                    "deny_rate": round(stats.get("deny_rate", 0), 4),
+                    "top_violations": stats.get("top_violations", [])[:5],
+                },
+                "governance": _governance_envelope(state, latency_ms),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_coverage(
+        declared_agents: list[str] | None = None,
+        cieu_db: str = "",
+    ) -> str:
+        """Detect governance blind spots: which agents lack coverage.
+
+        Compares declared agents against those actually seen in CIEU
+        records. Agents without governance events are blind spots.
+
+        Args:
+            declared_agents: List of expected agent IDs. If empty,
+                uses agents from the delegation chain.
+            cieu_db: Path to CIEU database.
+        """
+        t0 = time.perf_counter()
+        try:
+            # Declared agents: from parameter, delegation chain, or empty
+            declared = set(declared_agents or [])
+            for link in state.delegation_chain.links:
+                declared.add(link.actor)
+                declared.add(link.principal)
+            if state.delegation_chain.root:
+                declared.add(state.delegation_chain.root.actor)
+
+            # Seen agents from CIEU
+            seen = set()
+            cieu_store = None
+            if cieu_db:
+                from ystar.governance.cieu_store import CIEUStore
+                cieu_store = CIEUStore(cieu_db)
+            else:
+                cieu_store = state._cieu_store
+
+            if cieu_store:
+                try:
+                    events = cieu_store.query(limit=500)
+                    for ev in events:
+                        aid = getattr(ev, "agent_id", "")
+                        if aid:
+                            seen.add(aid)
+                except Exception:
+                    pass
+
+            covered = declared & seen
+            blind_spots = declared - seen
+            undeclared = seen - declared
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            coverage_rate = (len(covered) / len(declared) * 100) if declared else 0
+
+            return json.dumps({
+                "declared_agents": sorted(declared),
+                "seen_agents": sorted(seen),
+                "covered": sorted(covered),
+                "blind_spots": sorted(blind_spots),
+                "undeclared_agents": sorted(undeclared),
+                "coverage_rate": round(coverage_rate, 1),
+                "governance": _governance_envelope(state, latency_ms),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_trend(cieu_db: str = "", days: int = 7) -> str:
+        """7-day CIEU event trend analysis.
+
+        Shows daily breakdown of total events, deny count, and deny rate
+        with trend direction indicators.
+
+        Args:
+            cieu_db: Path to CIEU database.
+            days: Number of days to analyze (default 7).
+        """
+        t0 = time.perf_counter()
+        try:
+            cieu_store = None
+            if cieu_db:
+                from ystar.governance.cieu_store import CIEUStore
+                cieu_store = CIEUStore(cieu_db)
+            else:
+                cieu_store = state._cieu_store
+
+            if cieu_store is None:
+                return json.dumps({"error": "No CIEU store. Pass cieu_db path."})
+
+            # Query by day buckets
+            since = time.time() - (days * 86400)
+            events = cieu_store.query(since=since, limit=10000)
+
+            from collections import defaultdict
+            daily: Dict[str, Dict[str, int]] = defaultdict(
+                lambda: {"total": 0, "deny": 0, "allow": 0}
+            )
+            for ev in events:
+                ts = getattr(ev, "created_at", 0)
+                day = time.strftime("%Y-%m-%d", time.gmtime(ts))
+                daily[day]["total"] += 1
+                dec = getattr(ev, "decision", "")
+                if dec == "deny":
+                    daily[day]["deny"] += 1
+                elif dec == "allow":
+                    daily[day]["allow"] += 1
+
+            trend_data = []
+            prev_rate = None
+            for day in sorted(daily.keys()):
+                d = daily[day]
+                rate = round(d["deny"] / d["total"], 4) if d["total"] > 0 else 0
+                direction = "—"
+                if prev_rate is not None:
+                    if rate > prev_rate + 0.01:
+                        direction = "up"
+                    elif rate < prev_rate - 0.01:
+                        direction = "down"
+                    else:
+                        direction = "stable"
+                prev_rate = rate
+                trend_data.append({
+                    "day": day,
+                    "total": d["total"],
+                    "deny": d["deny"],
+                    "allow": d["allow"],
+                    "deny_rate": rate,
+                    "trend": direction,
+                })
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "days_analyzed": days,
+                "data": trend_data,
+                "governance": _governance_envelope(state, latency_ms),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_demo() -> str:
+        """Zero-config governance demo: 5 checks showing ALLOW and DENY.
+
+        Creates an in-memory contract and runs representative scenarios.
+        Perfect for first-time users to see gov-mcp in action.
+        No configuration required.
+        """
+        t0 = time.perf_counter()
+        demo_contract = IntentContract(
+            deny=["/etc", "/production", "/.env"],
+            deny_commands=["rm -rf", "sudo", "git push --force"],
+            only_paths=[],
+            only_domains=[],
+        )
+
+        scenarios = [
+            {"name": "Read safe file", "tool_name": "Read",
+             "params": {"file_path": "./src/main.py"}, "expect": "ALLOW"},
+            {"name": "Read secret file", "tool_name": "Read",
+             "params": {"file_path": "/etc/shadow"}, "expect": "DENY"},
+            {"name": "Read .env file", "tool_name": "Read",
+             "params": {"file_path": "/app/.env.production"}, "expect": "DENY"},
+            {"name": "Safe command", "tool_name": "Bash",
+             "params": {"command": "git status"}, "expect": "ALLOW"},
+            {"name": "Dangerous command", "tool_name": "Bash",
+             "params": {"command": "rm -rf /"}, "expect": "DENY"},
+        ]
+
+        results = []
+        for s in scenarios:
+            r = check(
+                params={"tool_name": s["tool_name"], **s["params"]},
+                result={},
+                contract=demo_contract,
+            )
+            decision = "ALLOW" if r.passed else "DENY"
+            correct = decision == s["expect"]
+            results.append({
+                "scenario": s["name"],
+                "decision": decision,
+                "expected": s["expect"],
+                "correct": correct,
+                "violations": _violations_to_list(r.violations) if not r.passed else [],
+            })
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        all_correct = all(r["correct"] for r in results)
+
+        return json.dumps({
+            "status": "PASS" if all_correct else "FAIL",
+            "scenarios": results,
+            "summary": f"{sum(1 for r in results if r['correct'])}/{len(results)} correct",
+            "message": "gov-mcp is working correctly!" if all_correct
+                       else "Some scenarios failed — check contract configuration.",
+            "governance": _governance_envelope(state, latency_ms),
+        })
+
+    @mcp.tool()
+    def gov_version() -> str:
+        """Return gov-mcp and Y*gov version information."""
+        versions = {"gov_mcp": "0.1.0"}
+        try:
+            import ystar
+            versions["ystar_gov"] = getattr(ystar, "__version__", "unknown")
+        except ImportError:
+            versions["ystar_gov"] = "not installed"
+
+        import sys
+        versions["python"] = sys.version.split()[0]
+        versions["platform"] = sys.platform
+
+        return json.dumps(versions)
+
+    # ===================================================================
+    # USER EXPERIENCE TOOLS
+    # ===================================================================
+
+    @mcp.tool()
+    def gov_init(
+        project_type: str = "generic",
+        custom_rules: list[str] | None = None,
+    ) -> str:
+        """Generate an AGENTS.md governance template for a project.
+
+        Creates a ready-to-use governance contract based on project type,
+        with sensible defaults that the user can customize.
+
+        Args:
+            project_type: One of "python", "node", "go", "generic".
+            custom_rules: Additional prohibition rules to include.
+        """
+        templates = {
+            "python": {
+                "deny": ["/etc", "/production", "/.env", "/.env.local",
+                         "/.env.production", "/__pycache__"],
+                "deny_commands": ["rm -rf", "sudo", "git push --force",
+                                  "pip install --upgrade pip"],
+                "only_paths": ["./src/", "./tests/", "./docs/"],
+                "description": "Python project",
+            },
+            "node": {
+                "deny": ["/etc", "/production", "/.env", "/.env.local",
+                         "/node_modules/.cache"],
+                "deny_commands": ["rm -rf", "sudo", "git push --force",
+                                  "npm publish"],
+                "only_paths": ["./src/", "./test/", "./lib/"],
+                "description": "Node.js project",
+            },
+            "go": {
+                "deny": ["/etc", "/production", "/.env"],
+                "deny_commands": ["rm -rf", "sudo", "git push --force"],
+                "only_paths": ["./cmd/", "./internal/", "./pkg/"],
+                "description": "Go project",
+            },
+            "generic": {
+                "deny": ["/etc", "/production", "/.env", "/.env.local",
+                         "/.env.production"],
+                "deny_commands": ["rm -rf", "sudo", "git push --force"],
+                "only_paths": [],
+                "description": "General project",
+            },
+        }
+
+        tmpl = templates.get(project_type, templates["generic"])
+
+        # Add custom rules
+        deny = list(tmpl["deny"])
+        deny_cmds = list(tmpl["deny_commands"])
+        if custom_rules:
+            for rule in custom_rules:
+                if rule.startswith("/") or rule.startswith("."):
+                    deny.append(rule)
+                else:
+                    deny_cmds.append(rule)
+
+        # Build AGENTS.md text
+        lines = [
+            f"# AGENTS.md — {tmpl['description']} governance contract",
+            "# Enforced by gov-mcp (Y*gov runtime governance)",
+            "",
+            "## Agent: default",
+            f"## Role: {tmpl['description']} development agent",
+            "",
+            "## Permitted: file read/write, shell commands, web search",
+            f"## Prohibited: {', '.join(deny_cmds)}",
+            "",
+            "## File access restrictions:",
+            f"## Denied paths: {', '.join(deny)}",
+        ]
+        if tmpl["only_paths"]:
+            lines.append(f"## Allowed paths: {', '.join(tmpl['only_paths'])}")
+        lines.extend([
+            "",
+            "## Obligation timing:",
+            "## Task acknowledgement: 300 seconds",
+            "## Task completion: 3600 seconds",
+        ])
+
+        agents_md = "\n".join(lines) + "\n"
+
+        return json.dumps({
+            "project_type": project_type,
+            "agents_md": agents_md,
+            "rules_summary": {
+                "deny": deny,
+                "deny_commands": deny_cmds,
+                "only_paths": tmpl["only_paths"],
+            },
+            "usage": "Save this as AGENTS.md in your project root, "
+                     "then run: gov-mcp install --agents-md ./AGENTS.md",
+        })
 
     return mcp
