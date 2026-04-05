@@ -1,0 +1,118 @@
+{
+  "scenario": "3 - Software Developer (HN)",
+  "days": {
+    "day1": {
+      "steps": [
+        {
+          "step": "1.1 pip install gov-mcp",
+          "action": "Install package",
+          "simulated": true,
+          "note": "Real install requires mcp package (Python 3.10+)"
+        },
+        {
+          "step": "1.2 gov-mcp install",
+          "ecosystems_detected": [
+            "claude-code",
+            "openclaw"
+          ],
+          "count": 2
+        },
+        {
+          "step": "1.3 gov_demo",
+          "results": [
+            {
+              "name": "Read safe file",
+              "decision": "ALLOW",
+              "correct": true
+            },
+            {
+              "name": "Read secret",
+              "decision": "DENY",
+              "correct": true
+            },
+            {
+              "name": "Read .env",
+              "decision": "DENY",
+              "correct": true
+            },
+            {
+              "name": "Safe cmd",
+              "decision": "ALLOW",
+              "correct": true
+            },
+            {
+              "name": "Dangerous cmd",
+              "decision": "DENY",
+              "correct": true
+            }
+          ],
+          "all_correct": true
+        }
+      ],
+      "obstacles": 0,
+      "satisfaction": 9,
+      "ttfv_seconds": 0.002,
+      "first_deny": "Day1 Step 1.3 scenario 2: Read secret"
+    },
+    "day2": {
+      "steps": [
+        {
+          "step": "2.1 Normal development workflow",
+          "total_actions": 13,
+          "false_positives": 0,
+          "result": "PASS"
+        }
+      ],
+      "false_positives": 0,
+      "obstacles": 0,
+      "satisfaction": 9
+    },
+    "day3": {
+      "steps": [
+        {
+          "step": "3.1 git push --force DENY",
+          "decision": "DENY",
+          "violation_message": "Command 'git push --force' is blocked in command",
+          "constraint": "deny_commands contains 'git push --force'",
+          "has_actionable_info": true
+        },
+        {
+          "step": "3.2 Auto-routing token savings",
+          "auto_routed_commands": 9,
+          "total_commands": 19,
+          "auto_route_ratio": "47.4%",
+          "tokens_saved_estimate": 2250,
+          "time_saved_estimate_s": 18.0,
+          "assumptions": {
+            "llm_roundtrip_tokens": 250,
+            "llm_roundtrip_time_s": 2.0
+          }
+        }
+      ],
+      "obstacles": 0,
+      "satisfaction": 8
+    }
+  },
+  "totals": {
+    "checks": 19,
+    "allow": 12,
+    "deny": 7,
+    "false_positives": 0,
+    "auto_routable": 9
+  },
+  "summary": {
+    "total_checks": 19,
+    "allow": 12,
+    "deny": 7,
+    "false_positives": 0,
+    "false_positive_rate": "0.0%",
+    "auto_routable": 9,
+    "auto_route_ratio": "47.4%",
+    "tokens_saved": 2250,
+    "time_saved_s": 18.0,
+    "ttfv_seconds": 0.002,
+    "first_deny_at": "Day1 Step 1.3 scenario 2: Read secret",
+    "avg_satisfaction": 8.7,
+    "verdict": "PASS"
+  }
+}
