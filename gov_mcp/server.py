@@ -36,15 +36,28 @@ from ystar.kernel.nl_to_contract import translate_to_contract, validate_contract
 class _State:
     """Mutable server state initialised at startup."""
 
-    def __init__(self, agents_md_path: Path, exec_whitelist_path: Optional[Path] = None) -> None:
-        self.agents_md_path = agents_md_path
-        self.agents_md_text = agents_md_path.read_text(encoding="utf-8")
-
-        # Translate AGENTS.md → contract (regex fallback, no LLM needed)
-        contract_dict, self.confidence_label, self.confidence_score = translate_to_contract(
-            self.agents_md_text
-        )
-        self.active_contract = _dict_to_contract(contract_dict)
+    def __init__(
+        self,
+        agents_md_path: Optional[Path] = None,
+        exec_whitelist_path: Optional[Path] = None,
+        session_config_path: Optional[Path] = None,
+    ) -> None:
+        # ── Contract source resolution (GOV-007 Step 2) ──────────────
+        # NEW (preferred since 0.2.0): if session_config_path provided,
+        # load contract directly from .ystar_session.json (structured,
+        # confidence ≥0.95). OLD (deprecated): if agents_md_path
+        # provided, regex-parse AGENTS.md (confidence ≤0.7).
+        if session_config_path is not None:
+            self._load_from_session_config(session_config_path)
+            config_dir = session_config_path.parent
+        elif agents_md_path is not None:
+            self._load_from_agents_md(agents_md_path)
+            config_dir = agents_md_path.parent
+        else:
+            raise ValueError(
+                "_State requires either session_config_path (recommended) "
+                "or agents_md_path (deprecated)"
+            )
 
         # Draft contract buffer (for load → validate → activate flow)
         self.draft_contract: Optional[IntentContract] = None
@@ -85,7 +98,10 @@ class _State:
         self._tighten_count = 0
 
         # ── P0-3: Session persistence path ─────────────────────────
-        self._state_db_path = agents_md_path.parent / ".gov_mcp_state.db"
+        # config_dir was determined above based on which contract source
+        # was used (session_config or agents_md). The state db lives
+        # next to the contract source file.
+        self._state_db_path = config_dir / ".gov_mcp_state.db"
         self._restore_from_db()
 
         # ── P1-#2: Background obligation scanner ───────────────────
@@ -94,6 +110,72 @@ class _State:
         self._scan_stop = __import__("threading").Event()
         self._last_scan_time = 0.0
         self._scan_results = []
+
+    # ── GOV-007 Step 2: contract source loaders ──────────────────────
+
+    def _load_from_session_config(self, path: Path) -> None:
+        """Load IntentContract directly from .ystar_session.json.
+
+        Preferred contract source since gov-mcp 0.2.0 (GOV-007 Step 2).
+        Reads structured JSON, validates schema_version, and constructs
+        the IntentContract via _dict_to_contract on the .contract
+        sub-object. Confidence is ~0.98 (structured load, zero parsing).
+
+        Raises ValueError on schema_version mismatch or unreadable file.
+        """
+        self.session_config_path = path
+        self.agents_md_path = None  # mutually exclusive
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise ValueError(
+                f"Cannot read .ystar_session.json at {path}: {e}"
+            ) from e
+
+        self._validate_schema_version(raw)
+
+        contract_dict = raw.get("contract", {})
+        self.active_contract = _dict_to_contract(contract_dict)
+        self.confidence_label = "session_config"
+        self.confidence_score = 0.98
+
+    def _load_from_agents_md(self, path: Path) -> None:
+        """Load IntentContract from AGENTS.md prose via regex translator.
+
+        Deprecated since gov-mcp 0.2.0 (use _load_from_session_config
+        instead). Kept for backward compatibility with old deployments
+        that pass --agents-md to gov-mcp's CLI. Confidence is typically
+        0.5-0.7 because regex parsing of prose loses structured detail.
+        """
+        self.agents_md_path = path
+        self.session_config_path = None
+        self.agents_md_text = path.read_text(encoding="utf-8")
+        contract_dict, self.confidence_label, self.confidence_score = (
+            translate_to_contract(self.agents_md_text)
+        )
+        self.active_contract = _dict_to_contract(contract_dict)
+
+    def _validate_schema_version(self, session_data: Dict[str, Any]) -> None:
+        """Validate .ystar_session.json schema_version against gov-mcp's
+        supported set. Refuse to start on unsupported schema."""
+        SUPPORTED_SCHEMAS = {"1.0"}
+        schema = session_data.get("schema_version")
+        if not schema:
+            import warnings
+            warnings.warn(
+                "[gov-mcp] .ystar_session.json missing schema_version "
+                "field. Assuming 1.0 for backward compat. Add "
+                "'schema_version': '1.0' to silence this warning.",
+                stacklevel=3,
+            )
+            return
+        if schema not in SUPPORTED_SCHEMAS:
+            raise ValueError(
+                f"[gov-mcp] Unsupported .ystar_session.json schema_version "
+                f"'{schema}'. Supported: {sorted(SUPPORTED_SCHEMAS)}. "
+                f"Either upgrade gov-mcp or downgrade .ystar_session.json "
+                f"schema."
+            )
 
     def start_background_scanner(self) -> None:
         """Start background thread that scans for overdue obligations."""
@@ -720,11 +802,19 @@ def _try_auto_execute(
 # ---------------------------------------------------------------------------
 
 def create_server(
-    agents_md_path: Path,
+    agents_md_path: Optional[Path] = None,
     exec_whitelist_path: Optional[Path] = None,
+    session_config_path: Optional[Path] = None,
     **kwargs: Any,
 ) -> FastMCP:
     """Create and return a configured GOV MCP server.
+
+    Contract source (exactly one required):
+      - session_config_path: path to .ystar_session.json (preferred
+        since gov-mcp 0.2.0). Direct dict load, no parsing,
+        confidence ≥0.95.
+      - agents_md_path: path to AGENTS.md (deprecated since 0.2.0).
+        Falls back to regex translation, confidence ≤0.7.
 
     Extra kwargs (host, port) are forwarded to FastMCP for SSE transport.
     """
@@ -734,7 +824,11 @@ def create_server(
         instructions="Y*gov governance as a standard MCP server",
         **kwargs,
     )
-    state = _State(agents_md_path, exec_whitelist_path=exec_whitelist_path)
+    state = _State(
+        agents_md_path=agents_md_path,
+        session_config_path=session_config_path,
+        exec_whitelist_path=exec_whitelist_path,
+    )
 
     # ===================================================================
     # CORE ENFORCEMENT LAYER
@@ -1487,8 +1581,13 @@ def create_server(
             "status": "loaded" if (hasattr(contract, "hash") and contract.hash) else "empty",
             "name": contract.name if hasattr(contract, "name") else "",
             "hash": contract.hash if hasattr(contract, "hash") else "",
-            "agents_md": str(state.agents_md_path),
+            # GOV-007 Step 2: surface both possible source paths so callers
+            # can tell whether contract came from session_config (preferred,
+            # ≥0.95) or agents_md (deprecated, ≤0.7).
+            "agents_md": str(state.agents_md_path) if state.agents_md_path else None,
+            "session_config": str(state.session_config_path) if state.session_config_path else None,
             "confidence": state.confidence_label,
+            "confidence_score": state.confidence_score,
         }
         if not (hasattr(contract, "hash") and contract.hash):
             failed.append("L1.01: contract not loaded or empty")
