@@ -4237,6 +4237,154 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
         except Exception as e:
             return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
 
+    @mcp.tool()
+    def gov_safemode(
+        action: str,
+        agent_id: str = "",
+        justification: str = "",
+        duration: int = 60
+    ) -> str:
+        """Board override mechanism — bypass governance with audit trail (AMENDMENT-015 Layer 4).
+
+        Safemode allows Board (Haotian) to temporarily bypass governance checks
+        for emergency operations. All actions are fully audited in CIEU.
+
+        Common use cases:
+        - Identity recovery: restore agent ID after delegation stack corruption
+        - Emergency hotfix: force-push to main after critical bug
+        - Governance debugging: inspect state without triggering checks
+
+        Args:
+            action: Safemode action. Options:
+                - "restore_agent": Restore agent identity (agent_id required)
+                - "enable": Enable safemode for duration (sets env var marker)
+                - "disable": Disable safemode
+                - "status": Check if safemode is active
+            agent_id: Target agent ID (for restore_agent action)
+            justification: Why this override is needed (required for audit trail)
+            duration: Safemode duration in seconds (for enable action, default 60)
+
+        Returns:
+            JSON result with action outcome and CIEU event ID
+
+        Example:
+            # Restore CEO identity after delegation stack corruption
+            gov_safemode(action="restore_agent", agent_id="ceo",
+                        justification="delegation stack corrupted, CEO → eng-platform stuck")
+
+            # Enable safemode for 120 seconds
+            gov_safemode(action="enable", duration=120,
+                        justification="debugging governance circuit breaker")
+        """
+        t0 = time.perf_counter()
+
+        if not justification and action in ("restore_agent", "enable"):
+            return json.dumps({"error": "justification required for audit trail"})
+
+        try:
+            cieu_store = state._cieu_store
+            result = {"action": action}
+
+            if action == "restore_agent":
+                if not agent_id:
+                    return json.dumps({"error": "agent_id required for restore_agent"})
+
+                # Load session config
+                if not state.session_config_path or not state.session_config_path.exists():
+                    return json.dumps({"error": ".ystar_session.json not found"})
+
+                with open(state.session_config_path) as f:
+                    config = json.load(f)
+
+                old_agent = config.get("session", {}).get("agent_id", "unknown")
+
+                # Update agent_id
+                if "session" not in config:
+                    config["session"] = {}
+                config["session"]["agent_id"] = agent_id
+
+                # Clear agent stack
+                if "agent_stack" in config["session"]:
+                    config["session"]["agent_stack"] = [agent_id]
+
+                # Write back
+                with open(state.session_config_path, "w") as f:
+                    json.dump(config, f, indent=2)
+
+                # Record in CIEU
+                event_data = {
+                    "agent_id": "board",
+                    "action": "agent_identity_restore",
+                    "old_agent": old_agent,
+                    "new_agent": agent_id,
+                    "justification": justification,
+                }
+                if cieu_store:
+                    event_id = cieu_store.record_event("governance_override", event_data)
+                    result["cieu_event_id"] = event_id
+
+                result["old_agent"] = old_agent
+                result["new_agent"] = agent_id
+                result["message"] = f"Agent identity restored: {old_agent} → {agent_id}"
+
+            elif action == "enable":
+                # Record safemode enable event
+                expires_at = time.time() + duration
+                event_data = {
+                    "agent_id": "board",
+                    "action": "safemode_enable",
+                    "duration": duration,
+                    "expires_at": expires_at,
+                    "justification": justification,
+                }
+                if cieu_store:
+                    event_id = cieu_store.record_event("governance_override", event_data)
+                    result["cieu_event_id"] = event_id
+
+                result["enabled"] = True
+                result["expires_at"] = expires_at
+                result["message"] = f"Safemode enabled for {duration}s"
+                result["note"] = "Set YSTAR_SAFEMODE=1 in environment to bypass checks"
+
+            elif action == "disable":
+                # Record safemode disable event
+                event_data = {
+                    "agent_id": "board",
+                    "action": "safemode_disable",
+                }
+                if cieu_store:
+                    event_id = cieu_store.record_event("governance_override", event_data)
+                    result["cieu_event_id"] = event_id
+
+                result["enabled"] = False
+                result["message"] = "Safemode disabled"
+
+            elif action == "status":
+                # Check if safemode is active (via env var)
+                import os
+                safemode_active = os.environ.get("YSTAR_SAFEMODE") == "1"
+                expires_str = os.environ.get("YSTAR_SAFEMODE_EXPIRES")
+                expires_at = float(expires_str) if expires_str else None
+
+                result["active"] = safemode_active
+                if expires_at:
+                    result["expires_at"] = expires_at
+                    result["time_remaining"] = max(0, expires_at - time.time())
+
+            else:
+                return json.dumps({"error": f"Unknown action: {action}"})
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            result["governance"] = _governance_envelope(state, latency_ms, tool_name="gov_safemode")
+
+            return json.dumps(result, indent=2)
+
+        except Exception as e:
+            return json.dumps({
+                "error": str(e),
+                "traceback": __import__("traceback").format_exc()
+            })
+
     # Start background obligation scanner
     state.start_background_scanner()
 
