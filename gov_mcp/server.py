@@ -1045,6 +1045,7 @@ def create_server(
         """Register a parent→child delegation and validate monotonicity.
 
         The child contract must be a strict subset of the parent's permissions.
+        Rejects invalid grants at registration time (v0.49.0+).
         """
         child_contract = IntentContract(
             deny=(deny or []),
@@ -1067,9 +1068,27 @@ def create_server(
             allow_redelegate=allow_redelegate,
             delegation_depth=delegation_depth,
         )
-        state.delegation_chain.append(link)
 
-        issues = state.delegation_chain.validate()
+        # FIX (2026-04-13): Validate BEFORE appending to prevent monotonicity violations
+        # Create temporary chain to test validity without mutating state
+        temp_chain = DelegationChain(links=state.delegation_chain.links.copy())
+        temp_chain.append(link)
+        issues = temp_chain.validate()
+
+        if issues:
+            # REJECT invalid grant
+            return json.dumps({
+                "registered": False,
+                "principal": principal,
+                "actor": actor,
+                "chain_depth": state.delegation_chain.depth,
+                "is_valid": False,
+                "issues": issues,
+                "error": "Grant violates monotonicity. Registration REJECTED.",
+            })
+
+        # Only append if validation passes
+        state.delegation_chain.append(link)
 
         # P0-3: Persist state after delegation change
         state.persist_to_db()
@@ -1079,8 +1098,8 @@ def create_server(
             "principal": principal,
             "actor": actor,
             "chain_depth": state.delegation_chain.depth,
-            "is_valid": len(issues) == 0,
-            "issues": issues,
+            "is_valid": True,
+            "issues": [],
         })
 
     @mcp.tool()
@@ -4042,6 +4061,178 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
                 "boost_factor": boost_factor,
                 "governance": _governance_envelope(state, latency_ms, tool_name="gov_memory_reinforce"),
             })
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_recall_v2(
+        query: str,
+        top_k: int = 5,
+        role: str | None = None,
+    ) -> str:
+        """Query Labs RAG semantic layer for similar tasks/lessons/skills.
+
+        This wraps labs_rag_query.py from ystar-company repo, providing
+        semantic search across team knowledge (BM25 + Maya's scoring).
+
+        Args:
+            query: Query string (e.g., "fix circuit breaker bug")
+            top_k: Number of results (default 5)
+            role: Optional role filter (ceo/cto/eng-platform/...)
+
+        Returns:
+            JSON with RAG hits and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            # Find ystar-company repo (sibling workspace)
+            gov_mcp_root = Path(__file__).parent.parent
+            company_root = gov_mcp_root.parent / "ystar-company"
+
+            if not company_root.exists():
+                return json.dumps({
+                    "error": "ystar-company repo not found at sibling workspace",
+                    "expected_path": str(company_root),
+                })
+
+            rag_script = company_root / "scripts" / "labs_rag_query.py"
+            if not rag_script.exists():
+                return json.dumps({
+                    "error": "labs_rag_query.py not found",
+                    "expected_path": str(rag_script),
+                })
+
+            # Build command
+            cmd = ["python3", str(rag_script), query, "--top-k", str(top_k)]
+            if role:
+                cmd.extend(["--role", role])
+
+            # Execute
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(company_root),
+            )
+
+            if result.returncode != 0:
+                return json.dumps({
+                    "error": "RAG query failed",
+                    "stderr": result.stderr,
+                    "returncode": result.returncode,
+                })
+
+            # Parse output
+            hits = []
+            current_hit = {}
+
+            for line in result.stdout.split('\n'):
+                # Match numbered entries
+                import re
+                match_entry = re.match(r'^(\d+)\.\s+(.+)$', line.strip())
+                if match_entry:
+                    if current_hit:
+                        hits.append(current_hit)
+                    current_hit = {"path": match_entry.group(2).strip()}
+                    continue
+
+                # Match score line
+                if line.strip().startswith("Score:"):
+                    parts = line.strip().split('|')
+                    score_match = re.search(r'Score:\s+([\d.]+)', parts[0])
+                    if score_match:
+                        current_hit["score"] = float(score_match.group(1))
+                    continue
+
+                # Match snippet
+                if line.strip().startswith("Snippet:"):
+                    current_hit["snippet"] = line.strip().replace("Snippet:", "").strip()
+                    continue
+
+            if current_hit:
+                hits.append(current_hit)
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "hits": hits,
+                "count": len(hits),
+                "query": query,
+                "governance": _governance_envelope(state, latency_ms, tool_name="gov_recall_v2"),
+            }, indent=2)
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_route(task_description: str, verbose: bool = False) -> str:
+        """Route a task to recommended owner using Labs Smart Dispatch Router.
+
+        This wraps labs_router.py from ystar-company repo, providing
+        deterministic task routing based on keywords × history × subsystems.
+
+        Args:
+            task_description: Task description (e.g., "fix circuit breaker bug")
+            verbose: Include debug scoring info
+
+        Returns:
+            JSON with routing recommendation and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            # Find ystar-company repo (sibling workspace)
+            gov_mcp_root = Path(__file__).parent.parent
+            company_root = gov_mcp_root.parent / "ystar-company"
+
+            if not company_root.exists():
+                return json.dumps({
+                    "error": "ystar-company repo not found at sibling workspace",
+                    "expected_path": str(company_root),
+                })
+
+            router_script = company_root / "scripts" / "labs_router.py"
+            if not router_script.exists():
+                return json.dumps({
+                    "error": "labs_router.py not found",
+                    "expected_path": str(router_script),
+                })
+
+            # Build command
+            cmd = ["python3", str(router_script), task_description, "--json"]
+            if verbose:
+                cmd.append("--verbose")
+
+            # Execute
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(company_root),
+            )
+
+            if result.returncode != 0:
+                return json.dumps({
+                    "error": "Router failed",
+                    "stderr": result.stderr,
+                    "returncode": result.returncode,
+                })
+
+            # Parse JSON output
+            try:
+                recommendation = json.loads(result.stdout)
+            except json.JSONDecodeError as e:
+                return json.dumps({
+                    "error": "Failed to parse router output",
+                    "parse_error": str(e),
+                    "stdout": result.stdout,
+                })
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            recommendation["governance"] = _governance_envelope(state, latency_ms, tool_name="gov_route")
+
+            return json.dumps(recommendation, indent=2)
 
         except Exception as e:
             return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
