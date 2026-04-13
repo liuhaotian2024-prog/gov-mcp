@@ -27,6 +27,9 @@ from ystar import (
     enforce,
 )
 from ystar.kernel.nl_to_contract import translate_to_contract, validate_contract_draft
+from ystar.memory import MemoryStore, Memory
+
+from gov_mcp.amendment_009_010_tools import register_amendment_tools
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +72,32 @@ class _State:
         # Omission engine
         self.omission_engine = OmissionEngine(store=InMemoryOmissionStore())
 
-        # CIEU store (None until a db path is provided via gov_report/gov_verify)
+        # CIEU store — FIX-1: persistent CIEU store on boot (was lazy-init → in_memory_only warn)
+        # Attach CIEUStore backed by .ystar_cieu.db at config_dir so gov_doctor L1.02
+        # reports "active" instead of in_memory_only, and so gov_report/verify see the
+        # same events that hook_wrapper writes via ystar.adapters.hook._write_cieu.
         self._cieu_store: Optional[Any] = None
+        try:
+            from ystar.governance.cieu_store import CIEUStore
+            cieu_db_path = config_dir / ".ystar_cieu.db"
+            self._cieu_store = CIEUStore(db_path=str(cieu_db_path))
+            self.db_path = cieu_db_path
+        except Exception as _cieu_boot_exc:
+            # Fail-open: if import/open fails we stay in the legacy None state.
+            # gov_doctor will still warn, but server remains up.
+            import logging
+            logging.getLogger(__name__).warning(
+                "CIEU persistent store init failed (%s); falling back to lazy init",
+                _cieu_boot_exc,
+            )
+
+        # Memory store (YML - Y*gov Memory Layer)
+        memory_db_path = config_dir / ".ystar_memory.db"
+        self.memory_store = MemoryStore(db_path=str(memory_db_path))
+
+        # Database paths (for health monitoring)
+        self.db_path: Optional[Path] = None
+        self.omission_db_path: Optional[Path] = None
 
         # Exec whitelist
         self.exec_whitelist = _load_exec_whitelist(exec_whitelist_path)
@@ -343,6 +370,13 @@ class _State:
                 label TEXT PRIMARY KEY, data_json TEXT)""")
             c.execute("""CREATE TABLE IF NOT EXISTS counters (
                 key TEXT PRIMARY KEY, value TEXT)""")
+
+            # FIX-2: delegations view — semantic alias over delegation_links
+            # Lets external tools (gov_self_test, verify scripts) query
+            # the canonical name `delegations` without schema drift.
+            c.execute("""CREATE VIEW IF NOT EXISTS delegations AS
+                SELECT principal, actor, contract_json, grant_id
+                FROM delegation_links""")
 
             # Clear and rewrite delegation links
             c.execute("DELETE FROM delegation_links")
@@ -1264,6 +1298,311 @@ def create_server(
         })
 
     @mcp.tool()
+    def gov_dispatch(
+        dispatcher_id: str,
+        target_agent: str,
+        task_id: str,
+        task_description: str,
+        channel: str = "unknown",
+        acknowledge_within_secs: float = 300.0,
+    ) -> str:
+        """Dispatch a task from one agent to another with governance enforcement.
+
+        This tool enforces delegation chain authority and creates an obligation
+        for the target agent to acknowledge receipt within the specified time.
+
+        Args:
+            dispatcher_id: The agent dispatching the task (e.g., "ceo").
+            target_agent: The agent receiving the task (e.g., "cto").
+            task_id: Unique identifier for this task.
+            task_description: Brief description of what needs to be done.
+            channel: How the task is delivered (telegram, agent_tool, ssh, etc).
+            acknowledge_within_secs: Time limit for acknowledgement (default 300s = 5min).
+
+        Returns:
+            JSON with decision (ALLOW/DENY), obligation_id if allowed, and reason if denied.
+        """
+        import uuid
+        from ystar.governance.omission_models import (
+            ObligationRecord, GovernanceEvent, GEventType, ObligationStatus,
+            OmissionType, Severity,
+        )
+
+        t0 = time.perf_counter()
+        chain = state.delegation_chain
+        now = time.time()
+
+        # 1. Check delegation chain authority: does dispatcher have authority over target_agent?
+        has_authority = False
+        authority_path = []
+
+        # Tree mode: check if target_agent is in dispatcher's subtree
+        if chain.root is not None:
+            # Find dispatcher's node
+            dispatcher_node = chain.all_contracts.get(dispatcher_id)
+            if dispatcher_node:
+                # Check if target is in dispatcher's children (direct or indirect)
+                def is_descendant(node, target):
+                    if node.actor == target:
+                        return True
+                    for child in node.children:
+                        if is_descendant(child, target):
+                            return True
+                    return False
+
+                has_authority = is_descendant(dispatcher_node, target_agent)
+                if has_authority:
+                    authority_path = [dispatcher_id, target_agent]
+
+        # Linear mode: check if dispatcher->target link exists
+        if not has_authority:
+            for link in chain.links:
+                if link.principal == dispatcher_id and link.actor == target_agent:
+                    has_authority = True
+                    authority_path = [dispatcher_id, target_agent]
+                    break
+
+        if not has_authority:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            denial_event = {
+                "event_type": "task_dispatch_denied",
+                "dispatcher_id": dispatcher_id,
+                "target_agent": target_agent,
+                "task_id": task_id,
+                "reason": "no_delegation_authority",
+                "timestamp": now,
+                "decision": "DENY",
+            }
+            if state._cieu_store:
+                try:
+                    state._cieu_store.write_dict(denial_event)
+                except Exception:
+                    pass
+
+            return json.dumps({
+                "decision": "DENY",
+                "reason": f"Agent '{dispatcher_id}' has no delegation authority over '{target_agent}'",
+                "dispatcher_id": dispatcher_id,
+                "target_agent": target_agent,
+                "task_id": task_id,
+                "authority_path": [],
+                "latency_ms": round(latency_ms, 4),
+            })
+
+        # 2. Check for HARD_OVERDUE obligations on dispatcher (blocks dispatch)
+        dispatcher_obs = state.omission_engine.store.list_obligations(
+            actor_id=dispatcher_id,
+            status=ObligationStatus.HARD_OVERDUE,
+        )
+        if dispatcher_obs:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            gate_event = {
+                "event_type": "task_dispatch_blocked",
+                "dispatcher_id": dispatcher_id,
+                "target_agent": target_agent,
+                "task_id": task_id,
+                "reason": "dispatcher_has_hard_overdue_obligations",
+                "hard_overdue_count": len(dispatcher_obs),
+                "timestamp": now,
+                "decision": "DENY",
+            }
+            if state._cieu_store:
+                try:
+                    state._cieu_store.write_dict(gate_event)
+                except Exception:
+                    pass
+
+            return json.dumps({
+                "decision": "DENY",
+                "reason": f"Dispatcher '{dispatcher_id}' has {len(dispatcher_obs)} HARD_OVERDUE obligations",
+                "dispatcher_id": dispatcher_id,
+                "target_agent": target_agent,
+                "task_id": task_id,
+                "hard_overdue_obligations": [ob.obligation_id for ob in dispatcher_obs],
+                "latency_ms": round(latency_ms, 4),
+            })
+
+        # 3. ALLOW — record dispatch event and create acknowledgement obligation
+        dispatch_event_id = str(uuid.uuid4())
+        dispatch_event = GovernanceEvent(
+            event_id=dispatch_event_id,
+            event_type=GEventType.TASK_DISPATCHED,
+            entity_id=task_id,
+            actor_id=dispatcher_id,
+            ts=now,
+            payload={
+                "target_agent": target_agent,
+                "task_description": task_description,
+                "channel": channel,
+                "acknowledge_within_secs": acknowledge_within_secs,
+            },
+            source="gov_dispatch",
+        )
+        state.omission_engine.store.add_event(dispatch_event)
+
+        # Create acknowledgement obligation for target_agent
+        obligation_id = str(uuid.uuid4())
+        obligation = ObligationRecord(
+            obligation_id=obligation_id,
+            entity_id=task_id,
+            actor_id=target_agent,
+            obligation_type=OmissionType.REQUIRED_ACKNOWLEDGEMENT.value,
+            trigger_event_id=dispatch_event_id,
+            required_event_types=[
+                GEventType.TASK_ACKNOWLEDGED,
+                GEventType.TASK_REJECTED,
+            ],
+            due_at=now + acknowledge_within_secs,
+            grace_period_secs=0.0,
+            hard_overdue_secs=acknowledge_within_secs * 0.5,  # 50% past deadline = hard overdue
+            status=ObligationStatus.PENDING,
+            severity=Severity.HIGH,
+            created_at=now,
+            updated_at=now,
+        )
+        state.omission_engine.store.add_obligation(obligation)
+
+        # Write CIEU event
+        cieu_event = {
+            "event_type": "task_dispatched",
+            "dispatcher_id": dispatcher_id,
+            "target_agent": target_agent,
+            "task_id": task_id,
+            "task_description": task_description,
+            "channel": channel,
+            "obligation_id": obligation_id,
+            "acknowledge_due_at": obligation.due_at,
+            "authority_path": authority_path,
+            "timestamp": now,
+            "decision": "ALLOW",
+        }
+        if state._cieu_store:
+            try:
+                state._cieu_store.write_dict(cieu_event)
+            except Exception:
+                pass
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        return json.dumps({
+            "decision": "ALLOW",
+            "dispatcher_id": dispatcher_id,
+            "target_agent": target_agent,
+            "task_id": task_id,
+            "obligation_id": obligation_id,
+            "acknowledge_due_at": obligation.due_at,
+            "authority_path": authority_path,
+            "channel": channel,
+            "latency_ms": round(latency_ms, 4),
+        })
+
+    @mcp.tool()
+    def gov_acknowledge(
+        agent_id: str,
+        task_id: str,
+        accepted: bool = True,
+        rejection_reason: str = "",
+    ) -> str:
+        """Acknowledge receipt of a dispatched task.
+
+        This tool fulfills the acknowledgement obligation created by gov_dispatch.
+
+        Args:
+            agent_id: The agent acknowledging the task.
+            task_id: The task ID from the original dispatch.
+            accepted: True to accept the task, False to reject.
+            rejection_reason: Required if accepted=False.
+
+        Returns:
+            JSON with status and obligation fulfillment details.
+        """
+        import uuid
+        from ystar.governance.omission_models import (
+            GovernanceEvent, GEventType, ObligationStatus,
+        )
+
+        t0 = time.perf_counter()
+        now = time.time()
+
+        # Find pending acknowledgement obligation for this task+agent
+        pending_obs = state.omission_engine.store.list_obligations(
+            entity_id=task_id,
+            actor_id=agent_id,
+            status=ObligationStatus.PENDING,
+        )
+
+        matching_ob = None
+        for ob in pending_obs:
+            if (GEventType.TASK_ACKNOWLEDGED in ob.required_event_types or
+                GEventType.TASK_REJECTED in ob.required_event_types):
+                matching_ob = ob
+                break
+
+        if matching_ob is None:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "status": "NOT_FOUND",
+                "reason": f"No pending acknowledgement obligation found for task '{task_id}' and agent '{agent_id}'",
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "latency_ms": round(latency_ms, 4),
+            })
+
+        # Create acknowledgement or rejection event
+        event_type = GEventType.TASK_ACKNOWLEDGED if accepted else GEventType.TASK_REJECTED
+        ack_event_id = str(uuid.uuid4())
+        ack_event = GovernanceEvent(
+            event_id=ack_event_id,
+            event_type=event_type,
+            entity_id=task_id,
+            actor_id=agent_id,
+            ts=now,
+            payload={
+                "accepted": accepted,
+                "rejection_reason": rejection_reason if not accepted else "",
+                "obligation_id": matching_ob.obligation_id,
+            },
+            source="gov_acknowledge",
+        )
+        state.omission_engine.store.add_event(ack_event)
+
+        # Fulfill the obligation
+        matching_ob.status = ObligationStatus.FULFILLED
+        matching_ob.fulfilled_by_event_id = ack_event_id
+        matching_ob.updated_at = now
+        state.omission_engine.store.update_obligation(matching_ob)
+
+        # Write CIEU event
+        cieu_event = {
+            "event_type": "task_acknowledged" if accepted else "task_rejected",
+            "agent_id": agent_id,
+            "task_id": task_id,
+            "accepted": accepted,
+            "rejection_reason": rejection_reason if not accepted else "",
+            "obligation_id": matching_ob.obligation_id,
+            "obligation_fulfilled": True,
+            "timestamp": now,
+        }
+        if state._cieu_store:
+            try:
+                state._cieu_store.write_dict(cieu_event)
+            except Exception:
+                pass
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        return json.dumps({
+            "status": "ACKNOWLEDGED" if accepted else "REJECTED",
+            "agent_id": agent_id,
+            "task_id": task_id,
+            "accepted": accepted,
+            "obligation_id": matching_ob.obligation_id,
+            "obligation_fulfilled": True,
+            "was_overdue": now > matching_ob.due_at if matching_ob.due_at else False,
+            "latency_ms": round(latency_ms, 4),
+        })
+
+    @mcp.tool()
     def gov_chain_reset(
         agent_id: str = "",
         confirm: bool = False,
@@ -1559,6 +1898,140 @@ def create_server(
             })
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def gov_precheck(
+        agent_id: str,
+        directive_id: str,
+        directive_level: int,
+        primary_dimension: str,
+        primary_risk: str,
+        assumption: str,
+        worst_case: str,
+        cross_dimension_note: str = "",
+        conclusion: str = "no_objection",
+    ) -> str:
+        """Validate executive precheck report against agent's cognitive profile.
+
+        Enforces role-based thinking discipline: agents must analyze Level 2/3
+        directives from their primary dimension first. Validates that precheck
+        matches the cognitive profile defined in .ystar_session.json.
+
+        Validation rules (deterministic, Iron Rule 1 compliant):
+        1. Level 1 directives → ALLOW (no validation required)
+        2. Load cognitive_profile from session config
+        3. Check primary_dimension in profile's primary_dimensions
+        4. Check primary_risk in profile's primary_risks
+        5. Check assumption and worst_case length >= 10
+        6. If conclusion == "escalate" → create CEO obligation
+
+        Args:
+            agent_id: Agent submitting precheck (e.g. "cto", "cmo")
+            directive_id: Directive identifier for tracking
+            directive_level: 1, 2, or 3 (Level 1 bypasses validation)
+            primary_dimension: Must match agent's cognitive profile
+            primary_risk: Must match agent's cognitive profile
+            assumption: Core assumption text (min 10 chars)
+            worst_case: Worst case outcome text (min 10 chars)
+            cross_dimension_note: Optional cross-role observation
+            conclusion: "no_objection" | "adjust" | "escalate"
+
+        Returns:
+            JSON with decision, violations (if any), and CIEU record
+        """
+        t0 = time.perf_counter()
+
+        # Load cognitive_profiles from session config
+        cognitive_profiles = {}
+        if state.session_config_path and state.session_config_path.exists():
+            try:
+                import json as json_lib
+                config = json_lib.loads(state.session_config_path.read_text())
+                cognitive_profiles = config.get("cognitive_profiles", {})
+            except Exception:
+                pass
+
+        # Validate precheck using Y*gov kernel
+        try:
+            from ystar.governance.precheck import validate_precheck
+
+            result = validate_precheck(
+                agent_id=agent_id,
+                directive_level=directive_level,
+                primary_dimension=primary_dimension,
+                primary_risk=primary_risk,
+                assumption=assumption,
+                worst_case=worst_case,
+                cognitive_profiles=cognitive_profiles,
+                cross_dimension_note=cross_dimension_note,
+                conclusion=conclusion,
+            )
+        except ImportError:
+            return json.dumps({
+                "error": "ystar.governance.precheck not available — upgrade ystar-gov"
+            })
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        decision = "ALLOW" if result.passed else "DENY"
+
+        # If conclusion == "escalate", create CEO obligation
+        obligation_created = False
+        if result.passed and conclusion == "escalate":
+            try:
+                from ystar.governance.omission_engine import ObligationRecord
+                obligation = ObligationRecord(
+                    obligation_id=f"precheck_escalate_{directive_id}",
+                    obligation_type="precheck_escalation_review",
+                    actor_id="ceo",
+                    created_at=time.time(),
+                    deadline=time.time() + 3600,  # 1 hour for CEO review
+                    context={
+                        "agent_id": agent_id,
+                        "directive_id": directive_id,
+                        "directive_level": directive_level,
+                        "primary_dimension": primary_dimension,
+                        "primary_risk": primary_risk,
+                        "assumption": assumption,
+                        "worst_case": worst_case,
+                    },
+                    severity="SOFT"
+                )
+                state.omission_engine.store.record_obligation(obligation)
+                obligation_created = True
+            except Exception:
+                pass
+
+        # Write CIEU record (decision-grade evidence)
+        state._write_cieu_event(
+            agent_id=agent_id,
+            event_type="gov_precheck",
+            decision=decision,
+            params={
+                "directive_id": directive_id,
+                "directive_level": directive_level,
+                "primary_dimension": primary_dimension,
+                "primary_risk": primary_risk,
+                "conclusion": conclusion,
+            },
+            violations=[result.reason] if not result.passed else [],
+            evidence_grade="decision",
+        )
+
+        return json.dumps({
+            "decision": decision,
+            "passed": result.passed,
+            "reason": result.reason,
+            "allowed_dimensions": result.allowed_dimensions,
+            "allowed_risks": result.allowed_risks,
+            "agent_id": agent_id,
+            "directive_id": directive_id,
+            "directive_level": directive_level,
+            "conclusion": conclusion,
+            "obligation_created": obligation_created,
+            "governance": _governance_envelope(
+                state, latency_ms, decision=decision, tool_name="gov_precheck"
+            ),
+        })
 
     @mcp.tool()
     def gov_doctor() -> str:
@@ -3209,7 +3682,374 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
             "governance": _governance_envelope(state, 0, tool_name="gov_risk_classify"),
         })
 
+    @mcp.tool()
+    def gov_health(
+        session_id: str,
+        window_size: int = 20,
+        threshold: float = 60.0,
+        cieu_db: str = "",
+        omission_db: str = "",
+    ) -> str:
+        """Agent health score based on degradation signal detection.
+
+        Analyzes CIEU event stream to detect five degradation signals:
+          - Repetition (31.25%): duplicate action patterns
+          - Obligation Decay (31.25%): declining completion rate
+          - Inflation (18.75%): abnormal tool call increase
+          - Fabrication (18.75%): violation pattern analysis
+          - Contradiction (0%): observation mode only (not scored)
+
+        Health score: 0-100 scale. Threshold default 60.
+
+        Reset policy (Board-approved):
+          - Health ≥40: agent may self-reset
+          - Health 25-40: supervisor confirmation required
+          - Health <25: Board decision required
+          - All resets MUST notify supervisor (Iron Rule)
+
+        Args:
+            session_id: Session to analyze.
+            window_size: Number of recent events (default 20).
+            threshold: Health threshold (default 60.0).
+            cieu_db: Path to CIEU database (optional).
+            omission_db: Path to omission database (optional).
+        """
+        t0 = time.perf_counter()
+        try:
+            from gov_mcp.health import compute_health_score, health_report_to_dict
+
+            # Resolve database paths
+            cieu_path = Path(cieu_db) if cieu_db else state.db_path
+            omission_path = Path(omission_db) if omission_db else state.omission_db_path
+
+            if not cieu_path or not cieu_path.exists():
+                return json.dumps({"error": "CIEU database not found"})
+
+            # Compute health
+            report = compute_health_score(
+                cieu_db_path=cieu_path,
+                omission_db_path=omission_path if omission_path and omission_path.exists() else None,
+                session_id=session_id,
+                window_size=window_size,
+                threshold=threshold,
+            )
+
+            result = health_report_to_dict(report)
+            latency_ms = (time.perf_counter() - t0) * 1000
+            result["governance"] = _governance_envelope(
+                state, latency_ms, tool_name="gov_health"
+            )
+
+            return json.dumps(result, indent=2)
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_health_retrospective(
+        cieu_db: str = "",
+        omission_db: str = "",
+        session_id: str = "",
+        checkpoint_interval: int = 10,
+    ) -> str:
+        """Historical health analysis across all sessions.
+
+        Batch-processes CIEU history to compute health scores at multiple
+        checkpoints per session. Identifies degradation patterns and
+        high-risk agents.
+
+        Use cases:
+          - Calibrate thresholds using real data
+          - Validate signal detection against known incidents
+          - Identify systematic agent degradation patterns
+
+        Args:
+            cieu_db: Path to CIEU database (optional).
+            omission_db: Path to omission database (optional).
+            session_id: Analyze specific session (empty = all sessions).
+            checkpoint_interval: Compute health every N events (default 10).
+        """
+        t0 = time.perf_counter()
+        try:
+            from gov_mcp.health import retrospective_analysis
+
+            # Resolve database paths
+            if cieu_db:
+                cieu_path = Path(cieu_db)
+            elif state.db_path:
+                cieu_path = state.db_path
+            elif state._cieu_store:
+                cieu_path = Path(state._cieu_store.db_path) if hasattr(state._cieu_store, 'db_path') else None
+            else:
+                cieu_path = None
+
+            if omission_db:
+                omission_path = Path(omission_db)
+            elif state.omission_db_path:
+                omission_path = state.omission_db_path
+            else:
+                omission_path = None
+
+            if not cieu_path or not cieu_path.exists():
+                return json.dumps({"error": "CIEU database path required. Specify cieu_db parameter."})
+
+            # Run retrospective analysis
+            results = retrospective_analysis(
+                cieu_db_path=cieu_path,
+                omission_db_path=omission_path if omission_path and omission_path.exists() else None,
+                session_id=session_id if session_id else None,
+                checkpoint_interval=checkpoint_interval,
+            )
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            results["governance"] = _governance_envelope(
+                state, latency_ms, tool_name="gov_health_retrospective"
+            )
+
+            return json.dumps(results, indent=2)
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    # ===================================================================
+    # Y*GOV MEMORY LAYER (YML)
+    # ===================================================================
+
+    @mcp.tool()
+    def gov_remember(
+        agent_id: str,
+        content: str,
+        memory_type: str = "knowledge",
+        initial_score: float = 1.0,
+        context_tags: list[str] | None = None,
+        half_life_days: float | None = None,
+        cieu_ref: str = "",
+    ) -> str:
+        """Store a memory in the Y*gov Memory Layer.
+
+        Args:
+            agent_id: Agent identifier (e.g., "ceo", "cto")
+            content: Memory content (text)
+            memory_type: Type of memory (decision, knowledge, obligation, lesson, task_context, relationship)
+            initial_score: Initial relevance score (0.0-1.0, default 1.0)
+            context_tags: Optional tags for filtering (e.g., ["deployment", "bug-fix"])
+            half_life_days: Custom half-life (overrides default for memory_type)
+            cieu_ref: Optional CIEU audit reference
+
+        Returns:
+            JSON with memory_id and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            mem = Memory(
+                agent_id=agent_id,
+                content=content,
+                memory_type=memory_type,
+                initial_score=initial_score,
+                context_tags=context_tags or [],
+            )
+            # Override half_life if provided
+            if half_life_days is not None:
+                mem.half_life_days = half_life_days
+
+            memory_id = state.memory_store.remember(mem, cieu_ref=cieu_ref or None)
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "status": "stored",
+                "memory_id": memory_id,
+                "agent_id": agent_id,
+                "memory_type": memory_type,
+                "governance": _governance_envelope(state, latency_ms, tool_name="gov_remember"),
+            })
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_recall(
+        agent_id: str,
+        memory_types: list[str] | None = None,
+        context_tags: list[str] | None = None,
+        min_relevance: float = 0.3,
+        limit: int = 10,
+        sort_by: str = "relevance_desc",
+    ) -> str:
+        """Retrieve memories with time-decay filtering.
+
+        Memories are scored by time-decay formula:
+            relevance = max(min_score, initial_score * (0.5 ** (age_days / half_life_days)))
+
+        Args:
+            agent_id: Agent identifier
+            memory_types: Filter by types (e.g., ["decision", "lesson"])
+            context_tags: Filter by tags (e.g., ["deployment"])
+            min_relevance: Exclude memories with current relevance < this
+            limit: Max results (default 10)
+            sort_by: "relevance_desc", "created_desc", "accessed_desc"
+
+        Returns:
+            JSON with list of memories and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            memories = state.memory_store.recall(
+                agent_id=agent_id,
+                memory_types=memory_types,
+                context_tags=context_tags,
+                min_relevance=min_relevance,
+                limit=limit,
+                sort_by=sort_by,
+            )
+
+            now = time.time()
+            results = [
+                {
+                    "memory_id": m.memory_id,
+                    "content": m.content,
+                    "memory_type": m.memory_type,
+                    "relevance": round(m.compute_relevance(now), 3),
+                    "initial_score": m.initial_score,
+                    "created_at": m.created_at,
+                    "access_count": m.access_count,
+                    "context_tags": m.context_tags,
+                }
+                for m in memories
+            ]
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "memories": results,
+                "count": len(results),
+                "agent_id": agent_id,
+                "governance": _governance_envelope(state, latency_ms, tool_name="gov_recall"),
+            }, indent=2)
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_forget(
+        memory_id: str,
+        reason: str = "",
+        cieu_ref: str = "",
+    ) -> str:
+        """Delete a memory (with CIEU audit trail).
+
+        Args:
+            memory_id: Memory to delete
+            reason: Audit reason for deletion
+            cieu_ref: Optional CIEU audit reference
+
+        Returns:
+            JSON with deletion status and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            deleted = state.memory_store.forget(
+                memory_id=memory_id,
+                reason=reason,
+                cieu_ref=cieu_ref or None,
+            )
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "status": "deleted" if deleted else "not_found",
+                "memory_id": memory_id,
+                "governance": _governance_envelope(state, latency_ms, tool_name="gov_forget"),
+            })
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_memory_summary(agent_id: str) -> str:
+        """Get agent memory health report.
+
+        Returns:
+            JSON with memory statistics:
+            - total_memories: Total count
+            - active_memories: Count with relevance >= 0.3
+            - usage_mb: Estimated storage
+            - fading_memories: Memories at risk (0.1 < relevance < 0.4)
+            - most_accessed: Top 5 frequently accessed
+        """
+        t0 = time.perf_counter()
+        try:
+            summary = state.memory_store.get_agent_summary(agent_id)
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            summary["governance"] = _governance_envelope(state, latency_ms, tool_name="gov_memory_summary")
+
+            return json.dumps(summary, indent=2, default=str)
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_memory_decay(prune_threshold: float = 0.1) -> str:
+        """Manual decay scan - prune memories below threshold.
+
+        Board mandate: This only DELETES memories, never updates scores.
+        Relevance is computed dynamically at query time.
+
+        Args:
+            prune_threshold: Delete memories with current relevance < this (default 0.1)
+
+        Returns:
+            JSON with scan results and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            scanned, pruned = state.memory_store.decay_scan(prune_threshold=prune_threshold)
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "scanned": scanned,
+                "pruned": pruned,
+                "prune_threshold": prune_threshold,
+                "governance": _governance_envelope(state, latency_ms, tool_name="gov_memory_decay"),
+            })
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
+    @mcp.tool()
+    def gov_memory_reinforce(
+        memory_id: str,
+        boost_factor: float = 1.2,
+    ) -> str:
+        """Reinforce a memory by boosting its initial_score.
+
+        Args:
+            memory_id: Memory to reinforce
+            boost_factor: Multiply initial_score by this (e.g., 1.2 = 20% boost, max 1.0)
+
+        Returns:
+            JSON with reinforcement status and governance envelope
+        """
+        t0 = time.perf_counter()
+        try:
+            reinforced = state.memory_store.reinforce(
+                memory_id=memory_id,
+                boost_factor=boost_factor,
+            )
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return json.dumps({
+                "status": "reinforced" if reinforced else "not_found",
+                "memory_id": memory_id,
+                "boost_factor": boost_factor,
+                "governance": _governance_envelope(state, latency_ms, tool_name="gov_memory_reinforce"),
+            })
+
+        except Exception as e:
+            return json.dumps({"error": str(e), "traceback": __import__("traceback").format_exc()})
+
     # Start background obligation scanner
     state.start_background_scanner()
+
+    # AMENDMENT-009+010: register 7 new tools
+    register_amendment_tools(mcp)
 
     return mcp
