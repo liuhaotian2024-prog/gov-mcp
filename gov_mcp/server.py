@@ -4050,6 +4050,6 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
     state.start_background_scanner()
 
     # AMENDMENT-009+010: register 7 new tools
-    register_amendment_tools(mcp)
+    register_amendment_tools(mcp, state)
 
     return mcp
