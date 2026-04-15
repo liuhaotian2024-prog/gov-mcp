@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "gov-mcp"
@@ -10,13 +10,17 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
-    "ystar-gov>=0.48.0",
+    "ystar>=0.48.0",
     "mcp>=1.0.0",
     "pyyaml>=6.0",
 ]
 
 [project.scripts]
 gov-mcp = "gov_mcp.cli:cli_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gov_mcp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

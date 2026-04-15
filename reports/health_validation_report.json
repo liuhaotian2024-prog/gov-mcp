@@ -1,0 +1,123 @@
+{
+  "total_sessions": 37,
+  "sessions": {
+    "BOARD-2026-04-09-E2E": {
+      "agent_id": "board",
+      "total_events": 5,
+      "checkpoints": [
+        {
+          "event_index": 5,
+          "timestamp": 1775784514.0187452,
+          "health": 100.0,
+          "signals": {
+            "repetition": 100.0,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        }
+      ],
+      "trend": "insufficient_data",
+      "final_health": 100.0
+    },
+    "GOV-008": {
+      "agent_id": "cto",
+      "total_events": 11,
+      "checkpoints": [
+        {
+          "event_index": 5,
+          "timestamp": 1775788660.5030951,
+          "health": 86.61,
+          "signals": {
+            "repetition": 57.14,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        },
+        {
+          "event_index": 10,
+          "timestamp": 1775789182.011144,
+          "health": 91.07,
+          "signals": {
+            "repetition": 71.43,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        }
+      ],
+      "trend": "insufficient_data",
+      "final_health": 91.07
+    },
+    "GOV-010": {
+      "agent_id": "cto",
+      "total_events": 8,
+      "checkpoints": [
+        {
+          "event_index": 5,
+          "timestamp": 1775827612.390965,
+          "health": 86.61,
+          "signals": {
+            "repetition": 57.14,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        }
+      ],
+      "trend": "insufficient_data",
+      "final_health": 86.61
+    },
+    "doctor_test": {
+      "agent_id": "ystar-hook",
+      "total_events": 16,
+      "checkpoints": [
+        {
+          "event_index": 5,
+          "timestamp": 1775759547.003409,
+          "health": 86.61,
+          "signals": {
+            "repetition": 57.14,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        },
+        {
+          "event_index": 10,
+          "timestamp": 1775763583.3355699,
+          "health": 77.68,
+          "signals": {
+            "repetition": 28.57,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        },
+        {
+          "event_index": 15,
+          "timestamp": 1775781199.9003031,
+          "health": 74.7,
+          "signals": {
+            "repetition": 19.05,
+            "obligation_decay": 100.0,
+            "inflation": 100.0,
+            "fabrication": 100.0,
+            "contradiction": 100.0
+          }
+        }
+      ],
+      "trend": "stable",
+      "final_health": 74.7
+    }
+  },
+  "high_risk_agents": [],
+  "degradation_patterns": {}
+}
