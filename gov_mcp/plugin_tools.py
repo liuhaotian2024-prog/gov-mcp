@@ -162,12 +162,76 @@ def register_plugin_tools(mcp: FastMCP, state: Any) -> None:
         Returns:
             JSON with installation status + created files list
         """
-        return json.dumps({
-            "status": "not_implemented",
-            "tool": "gov_install",
-            "message": "Day 3+ implementation pending (will wrap 'ystar setup' + 'ystar init')",
-            "params": {"project_dir": project_dir},
-        }, indent=2)
+        import subprocess
+        from pathlib import Path
+
+        try:
+            project_path = Path(project_dir).resolve()
+            if not project_path.exists():
+                return json.dumps({
+                    "success": False,
+                    "error": f"Project directory does not exist: {project_dir}",
+                }, indent=2)
+
+            # Run ystar setup + init via subprocess
+            setup_result = subprocess.run(
+                ["ystar", "setup"],
+                cwd=str(project_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if setup_result.returncode != 0:
+                return json.dumps({
+                    "success": False,
+                    "step": "ystar setup",
+                    "error": setup_result.stderr or setup_result.stdout,
+                }, indent=2)
+
+            init_result = subprocess.run(
+                ["ystar", "init"],
+                cwd=str(project_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if init_result.returncode != 0:
+                return json.dumps({
+                    "success": False,
+                    "step": "ystar init",
+                    "error": init_result.stderr or init_result.stdout,
+                }, indent=2)
+
+            # Check created files
+            created_files = []
+            session_json = project_path / ".ystar_session.json"
+            agents_md = project_path / "AGENTS.md"
+
+            if session_json.exists():
+                created_files.append(str(session_json))
+            if agents_md.exists():
+                created_files.append(str(agents_md))
+
+            return json.dumps({
+                "success": True,
+                "project_dir": str(project_path),
+                "created_files": created_files,
+                "setup_output": setup_result.stdout,
+                "init_output": init_result.stdout,
+            }, indent=2)
+
+        except subprocess.TimeoutExpired:
+            return json.dumps({
+                "success": False,
+                "error": "Installation timeout (>30s)",
+            }, indent=2)
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "error": str(e),
+            }, indent=2)
 
     @mcp.tool()
     def gov_omission_scan(
@@ -183,12 +247,43 @@ def register_plugin_tools(mcp: FastMCP, state: Any) -> None:
         Returns:
             JSON with list of detected omissions + confidence scores
         """
-        return json.dumps({
-            "status": "not_implemented",
-            "tool": "gov_omission_scan",
-            "message": "Day 3+ implementation pending (will use state.omission_engine.scan)",
-            "params": {
-                "lookback_hours": lookback_hours,
-                "min_confidence": min_confidence,
-            },
-        }, indent=2)
+        try:
+            if state.omission_engine is None:
+                return json.dumps({
+                    "success": False,
+                    "error": "Omission engine not initialized",
+                }, indent=2)
+
+            # Run omission scan via Y*gov OmissionEngine
+            # OmissionEngine.scan() returns List[Dict] with detected omissions
+            omissions = state.omission_engine.scan(
+                lookback_hours=lookback_hours,
+                min_confidence=min_confidence,
+            )
+
+            # Filter by confidence threshold
+            filtered_omissions = [
+                o for o in omissions
+                if o.get("confidence", 0.0) >= min_confidence
+            ]
+
+            return json.dumps({
+                "success": True,
+                "omissions": filtered_omissions,
+                "count": len(filtered_omissions),
+                "total_scanned": len(omissions),
+                "params": {
+                    "lookback_hours": lookback_hours,
+                    "min_confidence": min_confidence,
+                },
+            }, indent=2)
+
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "error": str(e),
+                "params": {
+                    "lookback_hours": lookback_hours,
+                    "min_confidence": min_confidence,
+                },
+            }, indent=2)
