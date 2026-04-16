@@ -4086,14 +4086,17 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
         """
         t0 = time.perf_counter()
         try:
-            # Find ystar-company repo (sibling workspace)
+            # Find ystar-company repo (env-based with sibling fallback, U5/W18 合流)
+            import os as _os
             gov_mcp_root = Path(__file__).parent.parent
-            company_root = gov_mcp_root.parent / "ystar-company"
+            _labs_dir = _os.environ.get('YSTAR_LABS_DIR')
+            company_root = Path(_labs_dir) if _labs_dir else gov_mcp_root.parent / "ystar-company"
 
             if not company_root.exists():
                 return json.dumps({
-                    "error": "ystar-company repo not found at sibling workspace",
+                    "error": "Y* Bridge Labs workspace not found",
                     "expected_path": str(company_root),
+                    "hint": "Set YSTAR_LABS_DIR env variable or place ystar-company as sibling",
                 })
 
             rag_script = company_root / "scripts" / "labs_rag_query.py"
@@ -4181,14 +4184,17 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
         """
         t0 = time.perf_counter()
         try:
-            # Find ystar-company repo (sibling workspace)
+            # Find ystar-company repo (env-based with sibling fallback, U5/W18 合流)
+            import os as _os
             gov_mcp_root = Path(__file__).parent.parent
-            company_root = gov_mcp_root.parent / "ystar-company"
+            _labs_dir = _os.environ.get('YSTAR_LABS_DIR')
+            company_root = Path(_labs_dir) if _labs_dir else gov_mcp_root.parent / "ystar-company"
 
             if not company_root.exists():
                 return json.dumps({
-                    "error": "ystar-company repo not found at sibling workspace",
+                    "error": "Y* Bridge Labs workspace not found",
                     "expected_path": str(company_root),
+                    "hint": "Set YSTAR_LABS_DIR env variable or place ystar-company as sibling",
                 })
 
             router_script = company_root / "scripts" / "labs_router.py"
