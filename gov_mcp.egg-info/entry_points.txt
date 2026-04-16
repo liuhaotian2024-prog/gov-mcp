@@ -1,0 +1,2 @@
+[console_scripts]
+gov-mcp = gov_mcp.cli:cli_main
