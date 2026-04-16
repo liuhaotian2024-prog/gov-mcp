@@ -1,0 +1,28 @@
+{
+  "manifest_version": "0.2",
+  "name": "gov-mcp",
+  "version": "0.1.0",
+  "description": "Runtime governance for AI agents — enforce file access, command execution, and delegation policies via MCP",
+  "author": {
+    "name": "Y* Bridge Labs",
+    "email": "liuhaotian2024@gmail.com"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "gov_mcp/server.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": ["-m", "gov_mcp.server"],
+      "env": {
+        "YSTAR_CONTRACTS_DIR": "${__dirname}/.ystar_contracts",
+        "YSTAR_CIEU_DB": "${__dirname}/.ystar_cieu.db"
+      }
+    }
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/liuhaotian2024-prog/gov-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liuhaotian2024-prog/gov-mcp.git"
+  }
+}
