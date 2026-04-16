@@ -30,6 +30,7 @@ from ystar.kernel.nl_to_contract import translate_to_contract, validate_contract
 from ystar.memory import MemoryStore, Memory
 
 from gov_mcp.amendment_009_010_tools import register_amendment_tools
+from gov_mcp.plugin_tools import register_plugin_tools
 
 
 # ---------------------------------------------------------------------------
@@ -4396,5 +4397,8 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
 
     # AMENDMENT-009+010: register 7 new tools
     register_amendment_tools(mcp, state)
+
+    # Register 8 plugin tools (2 implemented, 6 stubs — Day 2)
+    register_plugin_tools(mcp, state)
 
     return mcp
