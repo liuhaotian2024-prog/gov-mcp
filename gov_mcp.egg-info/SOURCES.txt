@@ -8,6 +8,7 @@ gov_mcp/benchmark.py
 gov_mcp/cli.py
 gov_mcp/dispatch_logic.py
 gov_mcp/health.py
+gov_mcp/plugin_tools.py
 gov_mcp/router.py
 gov_mcp/server.py
 gov_mcp.egg-info/PKG-INFO
@@ -42,5 +43,6 @@ tests/test_p0_infra.py
 tests/test_p0_security.py
 tests/test_p1_fixes.py
 tests/test_p1_omission_fixes.py
+tests/test_plugin_tools.py
 tests/test_sim001_remaining.py
 tests/test_sim001_scenario3.py
