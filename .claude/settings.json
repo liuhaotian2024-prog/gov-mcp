@@ -7,5 +7,18 @@
       "Edit(*)"
     ]
   },
-  "hooks": {}
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m ystar.hook 2>/dev/null || true",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
 }
