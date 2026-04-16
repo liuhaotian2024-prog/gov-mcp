@@ -33,3 +33,4 @@ test_*.py
 # Runtime
 scripts/.session_call_count
 scripts/.session_booted
+*.mcpb

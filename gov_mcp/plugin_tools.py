@@ -235,13 +235,11 @@ def register_plugin_tools(mcp: FastMCP, state: Any) -> None:
 
     @mcp.tool()
     def gov_omission_scan(
-        lookback_hours: int = 24,
         min_confidence: float = 0.7,
     ) -> str:
         """Scan for missing governance checks in recent actions.
 
         Args:
-            lookback_hours: How far back to scan (default 24h)
             min_confidence: Minimum confidence threshold for flagging omissions (0.0-1.0)
 
         Returns:
@@ -255,15 +253,25 @@ def register_plugin_tools(mcp: FastMCP, state: Any) -> None:
                 }, indent=2)
 
             # Run omission scan via Y*gov OmissionEngine
-            # OmissionEngine.scan() returns List[Dict] with detected omissions
-            omissions = state.omission_engine.scan(
-                lookback_hours=lookback_hours,
-                min_confidence=min_confidence,
-            )
+            # OmissionEngine.scan() returns EngineResult with violations list
+            scan_result = state.omission_engine.scan()
+
+            # Extract omissions from result
+            # EngineResult has violations: List[str] or similar structure
+            omissions_raw = []
+            if hasattr(scan_result, 'violations'):
+                omissions_raw = [
+                    {"type": "omission", "description": str(v), "confidence": 0.8}
+                    for v in scan_result.violations
+                ]
+            elif hasattr(scan_result, 'allowed') and not scan_result.allowed:
+                omissions_raw = [
+                    {"type": "omission", "description": scan_result.reason or "Unknown", "confidence": 0.8}
+                ]
 
             # Filter by confidence threshold
             filtered_omissions = [
-                o for o in omissions
+                o for o in omissions_raw
                 if o.get("confidence", 0.0) >= min_confidence
             ]
 
@@ -271,9 +279,8 @@ def register_plugin_tools(mcp: FastMCP, state: Any) -> None:
                 "success": True,
                 "omissions": filtered_omissions,
                 "count": len(filtered_omissions),
-                "total_scanned": len(omissions),
+                "total_scanned": len(omissions_raw),
                 "params": {
-                    "lookback_hours": lookback_hours,
                     "min_confidence": min_confidence,
                 },
             }, indent=2)
@@ -283,7 +290,6 @@ def register_plugin_tools(mcp: FastMCP, state: Any) -> None:
                 "success": False,
                 "error": str(e),
                 "params": {
-                    "lookback_hours": lookback_hours,
                     "min_confidence": min_confidence,
                 },
             }, indent=2)
