@@ -54,6 +54,7 @@ def test_escalation_check_validates_packet():
             "action_class": "external_contact",
             "reason": "business validation",
             "risk_summary": "could contact a customer",
+            "recommended_default": "hold until owner approves exact content",
         }
     )
     assert result["ok"] is True
@@ -64,4 +65,41 @@ def test_record_owner_decision_is_local_envelope_only():
     result = gov_company_record_owner_decision_impl({"decision": "approve", "action_id": "a1"})
     assert result["ok"] is True
     assert result["persistent_db_write"] is False
+    assert result["external_action_executed"] is False
+
+
+def test_admin_report_not_mission_bound_returns_simplify_or_archive():
+    result = gov_company_action_preflight_impl({"rule_type": "reporting_obligation", "rule": "daily report every night"})
+    assert result["decision"] == "SIMPLIFY_OR_ARCHIVE"
+    assert result["external_action_executed"] is False
+
+
+def test_mission_check_flags_admin_burden():
+    result = gov_company_mission_check_impl(
+        {
+            "mission_id": "m_admin",
+            "allowed_permission_tier": 0,
+            "admin_rules": [{"rule": "weekly report cadence"}],
+        }
+    )
+    assert result["admin_burden_detected"] is True
+
+
+def test_escalation_without_recommendation_fails_validation():
+    result = gov_company_escalation_check_impl(
+        {
+            "escalation_id": "e_missing_recommendation",
+            "requested_action": "manual customer discovery message",
+            "action_class": "external_contact",
+            "reason": "business validation",
+            "risk_summary": "could contact a customer",
+        }
+    )
+    assert result["ok"] is False
+    assert "recommended_default" in result["missing_fields"]
+
+
+def test_owner_decision_supports_request_more_evidence():
+    result = gov_company_record_owner_decision_impl({"decision": "request_more_evidence", "action_id": "a2"})
+    assert result["ok"] is True
     assert result["external_action_executed"] is False

@@ -13,6 +13,7 @@ from typing import Any, Dict
 from ystar.domains.company_runtime import (
     EscalationContract,
     build_escalation_decision,
+    classify_admin_rule,
     classify_company_action,
     mission_permission_check,
 )
@@ -26,7 +27,15 @@ def _now() -> str:
 
 def gov_company_action_preflight_impl(action_dict: Dict[str, Any], mission_dict: Dict[str, Any] | None = None) -> Dict[str, Any]:
     mission_dict = mission_dict or {}
-    if mission_dict:
+    action_text = " ".join(str(v).lower() for v in action_dict.values())
+    looks_admin = any(
+        marker in action_text
+        for marker in ("daily report", "weekly report", "nightly report", "reporting obligation", "content calendar", "posting schedule", "stale", "legacy")
+    ) or action_dict.get("rule_type") in {"administrative_action", "reporting_obligation", "stale_legacy_directive"}
+    if looks_admin:
+        result = classify_admin_rule(action_dict)
+        result["executes_action"] = False
+    elif mission_dict:
         result = mission_permission_check(mission_dict, action_dict)
     else:
         result = classify_company_action(action_dict)
@@ -40,6 +49,8 @@ def gov_company_mission_check_impl(mission_dict: Dict[str, Any]) -> Dict[str, An
     mission = DelegatedMissionContract.from_dict(mission_dict)
     tier = get_permission_tier(mission.allowed_permission_tier)
     missing_budget = tier.requires_budget and not mission.research_budget
+    admin_rules = list(mission_dict.get("admin_rules") or mission_dict.get("reporting_obligations") or [])
+    admin_burden = [classify_admin_rule(rule) for rule in admin_rules]
     return {
         "tool": "gov_company_mission_check",
         "mission_id": mission.mission_id,
@@ -48,6 +59,8 @@ def gov_company_mission_check_impl(mission_dict: Dict[str, Any]) -> Dict[str, An
         "missing_budget": missing_budget,
         "forbidden_actions": mission.forbidden_action_classes,
         "recommended_escalation_points": list(tier.escalation_required_for) + list(mission.required_review_points),
+        "admin_burden": admin_burden,
+        "admin_burden_detected": any(item.get("decision") == "SIMPLIFY_OR_ARCHIVE" for item in admin_burden),
         "external_action_executed": False,
     }
 
@@ -68,7 +81,7 @@ def gov_company_escalation_check_impl(escalation_dict: Dict[str, Any]) -> Dict[s
 
 def gov_company_record_owner_decision_impl(decision_dict: Dict[str, Any]) -> Dict[str, Any]:
     decision = str(decision_dict.get("decision") or "").strip()
-    allowed = {"approve", "reject", "request_revision", "hold"}
+    allowed = {"approve", "reject", "request_revision", "hold", "request_more_evidence"}
     ok = decision in allowed
     return {
         "tool": "gov_company_record_owner_decision",
