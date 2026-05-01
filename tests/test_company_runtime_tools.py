@@ -10,6 +10,7 @@ from gov_mcp.company_runtime_tools import (
     gov_company_action_preflight_impl,
     gov_company_admin_rule_check,
     gov_company_escalation_check,
+    gov_company_mission_action_preflight,
     gov_company_escalation_check_impl,
     gov_company_mission_check,
     gov_company_mission_check_impl,
@@ -134,6 +135,37 @@ def test_register_company_runtime_tools_registers_expected_names():
 def test_public_wrappers_match_helper_behavior():
     assert gov_company_mission_check({"mission_id": "m1", "allowed_permission_tier": 1})["missing_budget"] is True
     assert gov_company_record_owner_decision({"decision": "hold"})["external_action_executed"] is False
+
+
+def test_mission_action_preflight_combines_permission_admin_and_value():
+    result = gov_company_mission_action_preflight(
+        {"action": "read-only research for first paid customer interview"},
+        {"mission_id": "m1", "allowed_permission_tier": 1, "research_budget": {"max_pages_read": 5}},
+    )
+    assert result["available"] is True
+    assert result["external_action_executed"] is False
+    assert result["value_production_relevance"]["relevance"] == "HIGH"
+    assert result["permission"]["decision"] == "ALLOW_INTERNAL"
+
+
+def test_required_public_tools_are_callable_without_external_execution():
+    tools = [
+        gov_company_action_preflight({"action": "internal analysis"}, {}),
+        gov_company_mission_check({"mission_id": "m2", "allowed_permission_tier": 0}),
+        gov_company_admin_rule_check({"title": "old LinkedIn calendar"}),
+        gov_company_value_alignment_check({"title": "first paid customer interview"}),
+        gov_company_escalation_check(
+            {
+                "requested_action": "manual outreach",
+                "action_class": "customer_contact",
+                "reason": "validate demand",
+                "risk_summary": "external side effect",
+                "recommended_default": "hold",
+            }
+        ),
+        gov_company_record_owner_decision({"decision": "hold"}),
+    ]
+    assert all(item["external_action_executed"] is False for item in tools)
 
 
 def test_unavailable_ystar_domain_does_not_crash(monkeypatch):
