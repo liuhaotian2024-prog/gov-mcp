@@ -30,6 +30,7 @@ from ystar.kernel.nl_to_contract import translate_to_contract, validate_contract
 from ystar.memory import MemoryStore, Memory
 
 from gov_mcp.amendment_009_010_tools import register_amendment_tools
+from gov_mcp.company_runtime_tools import register_company_runtime_tools
 from gov_mcp.plugin_tools import register_plugin_tools
 
 
@@ -4400,5 +4401,8 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
 
     # Register 8 plugin tools (2 implemented, 6 stubs — Day 2)
     register_plugin_tools(mcp, state)
+
+    # Company runtime governance bridge: mission/action/escalation preflight only.
+    register_company_runtime_tools(mcp, state)
 
     return mcp
