@@ -20,6 +20,8 @@ class _StrEnum(str, Enum):
 class ProviderMode(_StrEnum):
     NO_SEND = "no_send"
     DRY_RUN = "dry_run"
+    SANDBOX_DISABLED = "sandbox_disabled"
+    SANDBOX_READY = "sandbox_ready"
     LIVE_DISABLED = "live_disabled"
     LIVE_READY = "live_ready"
     LIVE_BLOCKED = "live_blocked"
@@ -38,6 +40,9 @@ class ProviderCapability:
     suppression_guard_present: bool
     audit_receipt_enabled: bool
     rollback_reversal_path_present: bool
+    supports_sandbox: bool = False
+    sandbox_tests_passed: bool = False
+    sandbox_receipt_enabled: bool = False
     credential_required_for_live: bool = True
     external_network_required_for_live: bool = True
     external_provider_called: bool = False
@@ -57,10 +62,23 @@ class ProviderCapability:
             and self.audit_receipt_enabled
         )
 
+    def sandbox_ready(self) -> bool:
+        return bool(
+            self.mode_value() == ProviderMode.SANDBOX_READY.value
+            and self.supports_sandbox
+            and self.sandbox_tests_passed
+            and self.rate_limit_guard_present
+            and self.idempotency_guard_present
+            and self.suppression_guard_present
+            and self.audit_receipt_enabled
+            and self.sandbox_receipt_enabled
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["provider_mode"] = self.mode_value()
         data["live_ready"] = self.live_ready()
+        data["sandbox_ready"] = self.sandbox_ready()
         return data
 
 
@@ -77,6 +95,9 @@ def capability_from_mapping(data: Mapping[str, Any]) -> ProviderCapability:
         suppression_guard_present=bool(data.get("suppression_guard_present", False)),
         audit_receipt_enabled=bool(data.get("audit_receipt_enabled", False)),
         rollback_reversal_path_present=bool(data.get("rollback_reversal_path_present", False)),
+        supports_sandbox=bool(data.get("supports_sandbox", False)),
+        sandbox_tests_passed=bool(data.get("sandbox_tests_passed", False)),
+        sandbox_receipt_enabled=bool(data.get("sandbox_receipt_enabled", False)),
         credential_required_for_live=bool(data.get("credential_required_for_live", True)),
         external_network_required_for_live=bool(data.get("external_network_required_for_live", True)),
         external_provider_called=bool(data.get("external_provider_called", False)),

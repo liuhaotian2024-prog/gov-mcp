@@ -16,12 +16,17 @@ def build_provider_capability_manifest(
     provider_id: str = "disabled_live_outbound_provider",
     provider_mode: ProviderMode | str = ProviderMode.LIVE_DISABLED,
     provider_tests_passed: bool = True,
+    sandbox_tests_passed: bool = False,
     supports_live: bool | None = None,
+    supports_sandbox: bool | None = None,
 ) -> Dict[str, Any]:
     mode = provider_mode.value if isinstance(provider_mode, ProviderMode) else str(provider_mode)
     live_enabled = mode == ProviderMode.LIVE_READY.value
+    sandbox_enabled = mode == ProviderMode.SANDBOX_READY.value
     if supports_live is None:
         supports_live = live_enabled
+    if supports_sandbox is None:
+        supports_sandbox = mode in {ProviderMode.SANDBOX_READY.value, ProviderMode.SANDBOX_DISABLED.value}
     capability = ProviderCapability(
         provider_id=provider_id,
         provider_mode=mode,
@@ -34,6 +39,9 @@ def build_provider_capability_manifest(
         suppression_guard_present=True,
         audit_receipt_enabled=True,
         rollback_reversal_path_present=False,
+        supports_sandbox=bool(supports_sandbox),
+        sandbox_tests_passed=sandbox_tests_passed,
+        sandbox_receipt_enabled=bool(supports_sandbox),
         credential_required_for_live=True,
         external_network_required_for_live=True,
         external_provider_called=False,
@@ -47,13 +55,21 @@ def build_provider_capability_manifest(
             "provider_modes": [item.value for item in ProviderMode],
             "no_send_available": data["supports_no_send"],
             "dry_run_available": data["supports_dry_run"],
+            "sandbox_mode_available": True,
+            "sandbox_scaffold_available": True,
+            "sandbox_ready": capability.sandbox_ready(),
             "live_scaffold_available": True,
             "live_provider_enabled": capability.live_ready(),
+            "sandbox_execution_blocked_reason": "sandbox_provider_scaffolded_but_disabled" if not capability.sandbox_ready() else "sandbox_ready",
             "live_execution_blocked_reason": "live_provider_scaffolded_but_disabled" if not capability.live_ready() else "live_ready",
             "dry_run_receipt_type": "dry_run_receipt",
+            "sandbox_receipt_type": "sandbox_receipt",
             "live_receipt_type": "live_execution_receipt",
             "dry_run_and_live_receipts_distinct": True,
+            "sandbox_and_live_receipts_distinct": True,
+            "sandbox_and_dry_run_receipts_distinct": True,
             "no_external_api_call_in_e21": True,
+            "no_external_api_call_in_e25": True,
         }
     )
     return data
@@ -73,6 +89,12 @@ def validate_provider_capability_manifest(manifest: Mapping[str, Any]) -> List[s
         errors.append("dry_run_must_remain_available")
     if manifest.get("dry_run_and_live_receipts_distinct") is not True:
         errors.append("dry_run_live_receipts_must_be_distinct")
+    if manifest.get("sandbox_mode_available") is not True:
+        errors.append("sandbox_mode_must_be_available")
+    if manifest.get("sandbox_and_live_receipts_distinct") is not True:
+        errors.append("sandbox_live_receipts_must_be_distinct")
+    if manifest.get("sandbox_and_dry_run_receipts_distinct") is not True:
+        errors.append("sandbox_dry_run_receipts_must_be_distinct")
     if manifest.get("external_provider_called") is not False:
         errors.append("provider_call_must_not_occur_in_manifest")
     if manifest.get("real_message_sent") is not False:
@@ -81,4 +103,8 @@ def validate_provider_capability_manifest(manifest: Mapping[str, Any]) -> List[s
         errors.append("live_ready_mode_requires_live_provider_enabled")
     if manifest.get("provider_mode") != ProviderMode.LIVE_READY.value and manifest.get("live_provider_enabled") is True:
         errors.append("non_live_ready_mode_cannot_enable_live_provider")
+    if manifest.get("provider_mode") == ProviderMode.SANDBOX_READY.value and manifest.get("sandbox_ready") is not True:
+        errors.append("sandbox_ready_mode_requires_sandbox_ready_true")
+    if manifest.get("provider_mode") != ProviderMode.SANDBOX_READY.value and manifest.get("sandbox_ready") is True:
+        errors.append("non_sandbox_ready_mode_cannot_enable_sandbox")
     return list(dict.fromkeys(errors))
