@@ -46,6 +46,76 @@ gov-mcp sits between the agent and the system. Every action is checked against a
 pip install gov-mcp
 ```
 
+### First 5-minute proof: governed agent action
+
+This proof is local-first. It does not require a cloud account, a provider API
+key, payment, login, or external service. Its purpose is to show that an agent
+action can be routed through deterministic governance and produce an inspectable
+allow/deny result.
+
+1. Create a minimal `AGENTS.md` contract in a scratch directory:
+
+```markdown
+## Agent: local-demo-agent
+## Prohibited: rm -rf, sudo, .env files, /etc access
+## Permitted: file read/write, deterministic shell commands
+```
+
+2. Confirm the local CLI and server entry points are visible:
+
+```bash
+python -m gov_mcp --help
+python -m gov_mcp install --agents-md ./AGENTS.md --port 7922
+python -m gov_mcp status
+```
+
+3. In an MCP client, call `gov_demo` for the zero-config demo, or call
+`gov_check` twice:
+
+```json
+{
+  "agent_id": "local-demo-agent",
+  "tool_name": "shell",
+  "params": {"command": "pwd"}
+}
+```
+
+Expected: `ALLOW`, and a `governance` envelope with a CIEU sequence or contract
+hash when the runtime is configured.
+
+```json
+{
+  "agent_id": "local-demo-agent",
+  "tool_name": "shell",
+  "params": {"command": "cat .env"}
+}
+```
+
+Expected: `DENY`, with violation details explaining that `.env` access is
+blocked by the contract.
+
+4. If `status` says the server is not running, re-run install with an explicit
+contract path:
+
+```bash
+python -m gov_mcp install --agents-md ./AGENTS.md --port 7922
+```
+
+What this proves:
+
+- The local gov-mcp package exposes the server/CLI entry points.
+- A governance contract can be loaded locally.
+- The first visible value is a governed allow/deny action with evidence.
+
+What this does not prove:
+
+- customer validation;
+- paid signal;
+- production readiness;
+- compliance certification;
+- superiority over any incumbent.
+
+
 ### 2. Write your governance contract
 
 Create `AGENTS.md`:
