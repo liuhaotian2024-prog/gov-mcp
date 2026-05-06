@@ -57,6 +57,10 @@ def register_runtime_linkage_tools(mcp: Any, state: Any = None) -> None:
     from ystar.governance.centerline_contract import validate_centerline_contract
     from ystar.governance.readback_proof import validate_readback_proof
     from ystar.governance.runtime_linkage import validate_runtime_linkage_graph
+    from ystar.governance.capability_centerline_binding import (
+        evaluate_capability_binding_gate,
+        validate_capability_binding,
+    )
 
     @mcp.tool()
     def gov_validate_runtime_linkage(payload: Any) -> str:
@@ -93,3 +97,20 @@ def register_runtime_linkage_tools(mcp: Any, state: Any = None) -> None:
             return _envelope('gov_enforce_anti_drift_gate', {'allowed': False, 'failures': [{'reason': 'invalid_payload', 'details': data}], 'status': 'anti_drift_gate_failed_unknown'}, allowed=False)
         result = evaluate_anti_drift_gate(data)
         return _envelope('gov_enforce_anti_drift_gate', result, allowed=result.get('allowed') is True)
+
+    @mcp.tool()
+    def gov_validate_capability_binding(payload: Any) -> str:
+        data = _coerce_payload(payload)
+        if '__parse_error__' in data or '__unsupported_payload_type__' in data:
+            return _envelope('gov_validate_capability_binding', {'valid': False, 'failures': [{'reason': 'invalid_payload', 'details': data}]}, allowed=False)
+        record = data.get('capability_binding') if isinstance(data.get('capability_binding'), dict) else data
+        result = validate_capability_binding(record)
+        return _envelope('gov_validate_capability_binding', result, allowed=result.get('valid') is True)
+
+    @mcp.tool()
+    def gov_enforce_capability_centerline_gate(payload: Any) -> str:
+        data = _coerce_payload(payload)
+        if '__parse_error__' in data or '__unsupported_payload_type__' in data:
+            return _envelope('gov_enforce_capability_centerline_gate', {'allowed': False, 'failures': [{'reason': 'invalid_payload', 'details': data}], 'status': 'capability_binding_gate_failed_unknown'}, allowed=False)
+        result = evaluate_capability_binding_gate(data)
+        return _envelope('gov_enforce_capability_centerline_gate', result, allowed=result.get('allowed') is True)

@@ -12,3 +12,10 @@ Tools:
 Each tool accepts a JSON string or dictionary payload and returns a deterministic JSON envelope with `status`, `allowed`, `failures`, `warnings`, artifact counts, P0/P1 failure counts, and `no_external_action: true`.
 
 These tools do not perform outreach, publication, login, package installation, payment, secret access, or real client configuration mutation.
+
+## Capability Centerline Binding Tools
+
+- `gov_validate_capability_binding`: validates one capability binding record.
+- `gov_enforce_capability_centerline_gate`: enforces the capability-centerline binding gate for a manifest.
+
+These tools deny P0 cognitive capabilities outside CEO brain, behavior controls outside canonical runtime/governance, current-state evidence without readback, and reference-only artifacts consumed as current state. No external action is performed.
