@@ -32,6 +32,7 @@ from ystar.memory import MemoryStore, Memory
 from gov_mcp.amendment_009_010_tools import register_amendment_tools
 from gov_mcp.company_runtime_tools import register_company_runtime_tools
 from gov_mcp.plugin_tools import register_plugin_tools
+from gov_mcp.runtime_linkage_tools import register_runtime_linkage_tools
 
 
 # ---------------------------------------------------------------------------
@@ -4404,5 +4405,8 @@ class {name.title().replace("-", "").replace("_", "")}DomainPack:
 
     # Company runtime governance bridge: mission/action/escalation preflight only.
     register_company_runtime_tools(mcp, state)
+
+    # Runtime linkage anti-drift validators: generic Y-star-gov contract exposed via MCP.
+    register_runtime_linkage_tools(mcp, state)
 
     return mcp
